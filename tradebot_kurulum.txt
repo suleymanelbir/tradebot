@@ -1,0 +1,90 @@
+📌 Trade Bot Ortamına Erişim ve Aktivasyon Notları
+
+Bu dosya, sistem yeniden başlatıldığında veya VS Code üzerinden SSH bağlantısı kurulduğunda trade bot ortamına nasıl geçileceğini ve Python ortamının nasıl aktifleştirileceğini adım adım açıklar.
+
+---
+
+🔐 1. SSH ile Bağlantı Kur
+
+Terminal veya VS Code Remote-SSH üzerinden aşağıdaki profil ile bağlan:
+
+    ssh Selbir
+
+Bu bağlantı, `selbir` kullanıcısı ile sunucuya erişim sağlar.
+
+---
+
+📁 2. Trade Bot Dizinine Geç
+
+Bağlantı kurulduktan sonra aşağıdaki komutla trade bot dizinine geç:
+
+    cd /opt/tradebot
+
+Bu dizin, tüm uygulama dosyalarını ve Python ortamını içerir.
+
+---
+
+🐍 3. Python Ortamını Aktifleştir
+
+Trade bot için izole Python ortamını aktifleştirmek için:
+
+    source trade_env/bin/activate
+
+Bu komut ortamı aktif hale getirir. Terminalde `(trade_env)` ibaresi görünür.
+
+---
+
+🧪 4. Ortamın Aktif Olduğunu Kontrol Et
+
+Aşağıdaki komutlarla ortamın doğru şekilde aktifleştiğini doğrulayabilirsin:
+
+    which python
+    pip list
+
+Beklenen çıktı:
+- Python yolu: `/opt/tradebot/trade_env/bin/python`
+- Paket listesi: Flask, gunicorn, requests vb.
+
+---
+
+🛑 5. Ortamdan Çıkmak İçin
+
+İşin bittiğinde ortamdan çıkmak için:
+
+    deactivate
+
+Bu komut seni sistem Python’una geri döndürür.
+
+---
+
+📦 6. Uygulama Dosyaları
+
+Trade botun ana dosyaları bu dizindedir:
+
+    /opt/tradebot/app.py
+    /opt/tradebot/config.json
+    /opt/tradebot/logs/
+
+Gerekirse `gunicorn` ile çalıştırmak için:
+
+    gunicorn --workers 2 --bind 0.0.0.0:3000 app:app
+
+---
+
+✅ Notlar
+
+- Tüm dosyalar “selbir” kullanıcısına ait olmalıdır.
+- Root yetkisi sadece sistem yönetimi için kullanılmalıdır.
+- Ortam ve dizin yapısı sürdürülebilir mimariye göre tasarlanmıştır.
+
+sudo lsof -i :3000   3000 portunu kim kulllanıyor onun çıktsını veren komut
+
+Gunicorn üzerinden çalışıyor ve Nginx onu dış dünyaya açıyor. Yani:
+
+Kod dosyan: /opt/tradebot/test_app_1.py
+
+Flask uygulaman: Bu dosyada tanımlı app = Flask(__name__)
+
+HTML veya içerik eklemek istiyorsan: Flask içinde render_template() ile HTML dosyaları kullanabilirsin
+
+
