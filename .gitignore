@@ -1,6 +1,9 @@
-# ----------------------
-# Python derleme artıkları
-# ----------------------
+# ╔══════════════════════════════════════════════════════════╗
+# ║                   TRADEBOT • .gitignore                  ║
+# ║            okunaklı • düzenli • güvenli yapı             ║
+# ╚══════════════════════════════════════════════════════════╝
+
+# ── 1) Python derleme/artık dosyaları ─────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,26 +14,20 @@ __pycache__/
 build/
 dist/
 
-# ----------------------
-# Sanal ortamlar (virtualenv)
-# ----------------------
+# ── 2) Sanal ortamlar (virtualenv/conda/poetry) ──────────────────────────────
 venv/
 .venv/
 env/
-.trade_env/
 trade_env/
+.trade_env/
 
-# ----------------------
-# Günlük / log dosyaları
-# ----------------------
+# ── 3) Log dosyaları ──────────────────────────────────────────────────────────
 *.log
+log/
 logs/
 */logs/
-log/
 
-# ----------------------
-# Veritabanları (SQLite vs.)
-# ----------------------
+# ── 4) Veritabanları (SQLite) ────────────────────────────────────────────────
 *.db
 *.sqlite
 *.sqlite3
@@ -38,49 +35,48 @@ log/
 *.db-shm
 *.db-wal
 
-# ----------------------
-# Gizli bilgiler ve yerel configler
-# (Gerçek dosyaları ignore et; örneklerini repo’ya ekle)
-# ----------------------
+# ── 5) Genel gizli dosyalar (.env vb.) ───────────────────────────────────────
+# Not: Örnek dosyalar takipte kalsın
 .env
-.env.* 
+.env.*
 !.env.example
 
+# ── 6) Yapılandırmalar • globalislemler/config altında ───────────────────────
+#  - Gerçek dosyaları (json/.env) IGNORE ET
+#  - Sadece *.example* dosyalarını TAKİP ET
+globalislemler/config/.env
+globalislemler/config/*.json
+!globalislemler/config/.env.example
+!globalislemler/config/*.example
+!globalislemler/config/*.example.json
+
+# Kök dizinde yanlışlıkla kalabilecek gerçek config’ler:
 config.json
 symbols.json
-futures_trading_tegram.json
+telegram_config.json
 secrets*.json
 
-# Eğer config klasörün varsa ve içinde gerçek JSON’lar duruyorsa:
-# config/*.json
-# !config/*.example.json
-
-# ----------------------
-# Cache ve geçici dosyalar
-# ----------------------
+# ── 7) Cache / geçici dosyalar ───────────────────────────────────────────────
 .cache/
 *.cache
 *.tmp
+tmp/
 
-# ----------------------
-# IDE / OS dosyaları
-# ----------------------
+# ── 8) IDE / OS dosyaları ────────────────────────────────────────────────────
 .vscode/
-.idea/
 *.code-workspace
+.idea/
 .DS_Store
 Thumbs.db
 
-# ----------------------
-# Selenium / driver artıkları
-# ----------------------
+# ── 9) Selenium / WebDriver artıkları ────────────────────────────────────────
 chromedriver
 chromedriver.exe
 geckodriver
 chromedriver.log
 selenium-screenshots/
 
-# ----------------------
-# (İsteğe bağlı) ham veri klasörleri büyükse:
+# ── 10) (İsteğe bağlı) büyük ham veriler ─────────────────────────────────────
 # data/
 # !data/README.md
+
