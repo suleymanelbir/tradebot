@@ -1,4 +1,86 @@
+# ----------------------
+# Python derleme artıkları
+# ----------------------
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ----------------------
+# Sanal ortamlar (virtualenv)
+# ----------------------
+venv/
+.venv/
+env/
+.trade_env/
 trade_env/
-*.pyc
+
+# ----------------------
+# Günlük / log dosyaları
+# ----------------------
+*.log
+logs/
+*/logs/
+log/
+
+# ----------------------
+# Veritabanları (SQLite vs.)
+# ----------------------
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+
+# ----------------------
+# Gizli bilgiler ve yerel configler
+# (Gerçek dosyaları ignore et; örneklerini repo’ya ekle)
+# ----------------------
 .env
+.env.* 
+!.env.example
+
+config.json
+symbols.json
+futures_trading_tegram.json
+secrets*.json
+
+# Eğer config klasörün varsa ve içinde gerçek JSON’lar duruyorsa:
+# config/*.json
+# !config/*.example.json
+
+# ----------------------
+# Cache ve geçici dosyalar
+# ----------------------
+.cache/
+*.cache
+*.tmp
+
+# ----------------------
+# IDE / OS dosyaları
+# ----------------------
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# Selenium / driver artıkları
+# ----------------------
+chromedriver
+chromedriver.exe
+geckodriver
+chromedriver.log
+selenium-screenshots/
+
+# ----------------------
+# (İsteğe bağlı) ham veri klasörleri büyükse:
+# data/
+# !data/README.md

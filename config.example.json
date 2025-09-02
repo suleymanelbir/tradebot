@@ -1,0 +1,6 @@
+{
+  "trading": {
+    "trade_amount_usdt": 50,
+    "dry_mode": true
+  }
+}

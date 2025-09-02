@@ -1,0 +1,47 @@
+{
+  "symbols": [
+    "CRYPTOCAP:USDT.D",
+    "CRYPTOCAP:BTC.D",
+    "CRYPTOCAP:TOTAL3"
+  ],
+  "timeframes": [
+    "15m",
+    "1h",
+    "4h",
+    "1d"
+  ],
+  "paths": {
+    "log_dir": "/opt/tradebot/log",
+    "db_path": "/opt/tradebot/globalislemler/veritabanı/global_data.db",
+    "telegram_config": "/opt/tradebot/globalislemler/config/global_data_config.json"
+  },
+  "logging_level": "INFO",
+  "selenium_pool": {
+    "size": 1,
+    "chromedriver_path": "/usr/bin/chromedriver"
+  },
+  "fetch": {
+    "retries": 3,
+    "wait_seconds": 25,
+    "delay_after_close_sec": 60,
+    "fetch_every_sec": 30
+  },
+  "price_limits": {
+    "CRYPTOCAP:USDT.D": {
+      "lower": 3.0,
+      "upper": 8.0
+    },
+    "CRYPTOCAP:BTC.D": {
+      "lower": 30.0,
+      "upper": 80.0
+    },
+    "CRYPTOCAP:TOTAL3": {
+      "lower": 50000000000.0,
+      "upper": 2000000000000.0
+    }
+  },
+  "retention": {
+    "global_live": 5000,
+    "global_closing": 8000
+  }
+}

@@ -13,5 +13,5 @@ def test_request():
     return {"status_code": response.status_code, "url": response.url}
 
 if __name__ == '__main__':
-    app.run(port=3000)
+    app.run(host="0.0.0.0",port=3000)
 

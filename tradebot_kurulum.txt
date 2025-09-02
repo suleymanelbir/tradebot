@@ -88,3 +88,5 @@ Flask uygulaman: Bu dosyada tanımlı app = Flask(__name__)
 HTML veya içerik eklemek istiyorsan: Flask içinde render_template() ile HTML dosyaları kullanabilirsin
 
 
+sudo rm /etc/nginx/sites-enabled/tradebot
+Bu, tradebot yapılandırmasını devre dışı bırakır ama silmez. Dosya hâlâ sites-available içinde durur.

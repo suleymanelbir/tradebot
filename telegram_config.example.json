@@ -1,0 +1,6 @@
+{
+  "bots": [
+    { "name": "main_bot", "token": "YOUR_TOKEN", "chat_id": "YOUR_CHAT_ID" },
+    { "name": "alerts_bot", "token": "YOUR_TOKEN", "chat_id": "YOUR_CHAT_ID" }
+  ]
+}
