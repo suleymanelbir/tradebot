@@ -1,6 +1,9 @@
-flask
-requests
-# /opt/tradebot/requirements.txt
+# Çekirdek bağımlılıklar
 requests>=2.31,<3
 selenium>=4.21,<5
-webdriver-manager>=4,<5  # (opsiyonel)
+
+# Opsiyonel (chromedriver’ı otomatik indirmek için)
+webdriver-manager>=4,<5
+
+# Eğer web arayüzü planlıyorsan bırak, yoksa silebilirsin
+flask
