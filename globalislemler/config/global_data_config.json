@@ -12,7 +12,7 @@
   ],
   "paths": {
     "log_dir": "/opt/tradebot/log",
-    "db_path": "/opt/tradebot/globalislemler/veritabanı/global_data.db",
+    "db_path": "/opt/tradebot/veritabani/global_data.db",
     "telegram_config": "/opt/tradebot/globalislemler/config/global_data_config.json"
   },
   "logging_level": "INFO",

@@ -1,7 +1,24 @@
+# servisi başlatma komuut: sudo systemctl start tradebot-global.service
+# sudo systemctl stop tradebot-global.service
+
+# Servisin Durumunu Kontrol Etmek: sudo systemctl status tradebot-global.service
+# Servisin çıktısını, logları ve olası hataları canlı izlemek için: sudo journalctl -u tradebot-global.service -f
+# Servisi Yeniden Başlatmak: sudo systemctl restart tradebot-global.service
+"""Servisi başlat: sudo systemctl start tradebot-global.service
+
+Logları izle: sudo journalctl -u tradebot-global.service -f
+"""
+
 # manuel çıkıştan sonra : driver.quit()     kullanılması gerekiyor.
 # python3 /opt/tradebot/globalislemler/database_manager_5.py
 # ps aux | grep database_manager_5.py
 
+# ***************************************************************************************************************************
+#  alias tradebot-start='sudo systemctl start tradebot-global.service && sudo journalctl -u tradebot-global.service -n 20'  *
+#  alias tradebot-stop='sudo systemctl stop tradebot-global.service'                                                        *
+#  alias tradebot-log='sudo journalctl -u tradebot-global.service -f'                                                       *
+#                                                                                                                           *
+# ***************************************************************************************************************************
 
 import requests
 import os
@@ -10,6 +27,7 @@ import sqlite3
 import logging
 import asyncio
 import time
+
 from datetime import datetime, timedelta, timezone
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -1124,12 +1142,30 @@ async def main_trading():
 
 # Ana giriş noktası
 if __name__ == "__main__":
-    try:
-        # Telegram yapılandırma yolunu belirle
-        telegram_config_path = "/root/Botson/9_simsar/Dominance/simsar/Dominace_2/Devin_2/futures_trading_tegram.json"
+    from pathlib import Path
 
-        # Telegram yapılandırmasını yükle
-        bots = load_telegram_config(telegram_config_path)
+    BASE = Path(__file__).resolve().parent
+    CFG_DIR = BASE / "config"
+    TELEGRAM_CFG = CFG_DIR / "telegram_bots.json"
+    GLOBAL_CFG = CFG_DIR / "global_data_config.json"
+
+    bots = {}  # fail-open: telegram yoksa da servis çalışsın
+    conn = None
+    cursor = None
+
+    try:
+        # Telegram yapılandırmasını yükle (opsiyonel)
+        try:
+            bots = load_telegram_config(str(TELEGRAM_CFG))
+        except FileNotFoundError:
+            logging.warning(f"Telegram config bulunamadı, devam ediliyor: {TELEGRAM_CFG}")
+            bots = {}
+        except PermissionError:
+            logging.error(f"Telegram config izin hatası, Telegram devre dışı: {TELEGRAM_CFG}")
+            bots = {}
+        except Exception as e:
+            logging.exception("Telegram config yüklenemedi, Telegram devre dışı")
+            bots = {}
 
         # Veritabanı bağlantısını oluştur
         conn, cursor = connect_db()
@@ -1140,52 +1176,64 @@ if __name__ == "__main__":
         create_global_tables(cursor)
         conn.commit()
 
-        # Başlatma mesajını gönder
-        #send_telegram_message("✅ Program başarıyla başlatıldı.", "main_bot", bots)
+        # Başlatma mesajı (isteğe bağlı)
+        # if bots: send_telegram_message("✅ Program başarıyla başlatıldı.", "main_bot", bots)
 
-        # Sembolleri kontrol et ve yükle
-        symbols_path = "/root/Botson/9_simsar/Dominance/simsar/Dominace_2/Devin_2/symbols.json"
-        if not os.path.exists(symbols_path):
-            raise FileNotFoundError(f"Symbols configuration file not found: {symbols_path}")
+        # Sembolleri yükle (tek kaynak: global_data_config.json)
+        with open(GLOBAL_CFG, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
 
-        with open(symbols_path, "r") as file:
-            config = json.load(file)
-
-        global_symbols = config.get("global_symbols", [])
+        global_symbols = cfg.get("symbols", [])
         if not global_symbols:
-            raise ValueError("No symbols found in the 'global_symbols' key of the symbols configuration file.")
+            raise ValueError("No symbols found in the 'symbols' key of the global_data_config.json file.")
 
         logging.info(f"Loaded global symbols: {global_symbols}")
 
-        # Ana işlem döngüsünü başlat
-        asyncio.run(main_trading())
-    
+        # Ana işlem döngüsünü başlat (sembolleri aktar!)
+        asyncio.run(main_trading(global_symbols))
+
     except FileNotFoundError as e:
         logging.error(f"File not found: {e}", exc_info=True)
-        if 'bots' in locals():
-            send_telegram_message(f"❌ Configuration file error: {e}", "main_bot", bots)
+        if bots:
+            try:
+                send_telegram_message(f"❌ Configuration file error: {e}", "main_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (FileNotFoundError).")
 
     except ConnectionError as e:
         logging.error(f"Database connection error: {e}", exc_info=True)
-        if 'bots' in locals():
-            send_telegram_message(f"❌ Database connection error: {e}", "main_bot", bots)
+        if bots:
+            try:
+                send_telegram_message(f"❌ Database connection error: {e}", "main_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (ConnectionError).")
 
     except ValueError as e:
         logging.error(f"Configuration error: {e}", exc_info=True)
-        if 'bots' in locals():
-            send_telegram_message(f"❌ Configuration error: {e}", "main_bot", bots)
+        if bots:
+            try:
+                send_telegram_message(f"❌ Configuration error: {e}", "main_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (ValueError).")
 
     except Exception as e:
         logging.error(f"Unexpected fatal error: {e}", exc_info=True)
-        if 'bots' in locals():
-            send_telegram_message(f"❌ Fatal Error: {e}", "main_bot", bots)
-    
+        if bots:
+            try:
+                send_telegram_message(f"❌ Fatal Error: {e}", "main_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (Fatal).")
+
     finally:
         # Veritabanı bağlantısını kapat
-        if 'conn' in locals() and conn:
-            conn.close()
-            logging.info("Database connection closed.")
-            if 'bots' in locals():
-                send_telegram_message("🔌 Database connection closed.", "main_bot", bots)
-import time
-time.sleep(30)
+        try:
+            if conn:
+                conn.close()
+                logging.info("Database connection closed.")
+                if bots:
+                    try:
+                        send_telegram_message("🔌 Database connection closed.", "main_bot", bots)
+                    except Exception:
+                        logging.warning("Telegram bildirimi gönderilemedi (shutdown).")
+        except Exception:
+            logging.exception("DB kapanışı sırasında hata")
