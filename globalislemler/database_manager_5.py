@@ -19,51 +19,64 @@ Logları izle: sudo journalctl -u tradebot-global.service -f
 #  alias tradebot-log='sudo journalctl -u tradebot-global.service -f'                                                       *
 #                                                                                                                           *
 # ***************************************************************************************************************************
-
-import requests
 import os
 import json
 import sqlite3
 import logging
 import asyncio
 import time
-
+import tempfile, shutil, random
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Any
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+# Kullanacaksan açık bırak; kullanmayacaksan Ruff için kaldır:
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 print("✅ Script başladı")
 
-# Logging ayarı
+# ─────────────────────────────────────────────────────────────
+# 1) Merkezî yol sabitleri (ENV ile override edilebilir)
+# ─────────────────────────────────────────────────────────────
+CONFIG_DIR = os.getenv("TRADEBOT_CONFIG_DIR", "/opt/tradebot/globalislemler/config")
+DB_PATH    = os.getenv("TRADEBOT_DB_PATH",    "/opt/tradebot/veritabani/global_data.db")
+LOG_DIR    = os.getenv("TRADEBOT_LOG_DIR",    "/opt/tradebot/log")  # JSON'da da /opt/tradebot/log
+
+# Dizinleri garantiye al
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+Path(Path(DB_PATH).parent).mkdir(parents=True, exist_ok=True)
+
+# Config dosya isimleri (varsayılan)
+GLOBAL_CFG   = os.path.join(CONFIG_DIR, "global_data_config.json")
+TELEGRAM_CFG = os.path.join(CONFIG_DIR, "telegram_bots.json")
+SYMBOLS_CFG  = os.path.join(CONFIG_DIR, "symbols.json")
+
+# ─────────────────────────────────────────────────────────────
+# 2) Logging (klasör hazırlandıktan sonra!)
+# ─────────────────────────────────────────────────────────────
 logging.basicConfig(
-    filename='/opt/tradebot/log/database_manager_5.log',  # Log dosyasının adı
-    level=logging.INFO,  # Log seviyesini INFO olarak ayarladık
-    format='%(asctime)s %(levelname)s %(message)s',  # Log formatı
-    datefmt='%Y-%m-%d %H:%M:%S'  # Tarih formatı (isteğe bağlı)
+    filename=os.path.join(LOG_DIR, "database_manager_5.log"),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-
 logging.info("Database manager başlatıldı.")
+logging.info("RUNNING_FROM_FILE=%s", __file__)
 
-INTERVAL_DUPLICATE_CHECK = {
-    "15m": timedelta(minutes=12),                      # 10 dakika
-    "1h": timedelta(minutes=53, seconds=30),           # 45 dakika 30 saniye
-    "4h": timedelta(hours=3, minutes=50, seconds=15),  # 3 saat 50 dakika 15 saniye
-    "1d": timedelta(hours=23, minutes=50, seconds=45)  # 23 saat 45 dakika 45 saniye
-}
+# ─────────────────────────────────────────────────────────────
+# 3) Tablolar, veritabanı, limitler
+# ─────────────────────────────────────────────────────────────
+DB_NAME = DB_PATH  # sqlite için tam yol
 
-
-
-# Veritabanı adı
-DB_NAME = "trading_data.db"
-GLOBAL_LIVE_TABLE = "global_live_data"
+GLOBAL_LIVE_TABLE    = "global_live_data"
 GLOBAL_CLOSING_TABLE = "global_closing_data"
 
-# Kayıt limitleri
 RECORD_LIMITS = {
     GLOBAL_LIVE_TABLE: 1500,
     GLOBAL_CLOSING_TABLE: 5000
@@ -71,67 +84,81 @@ RECORD_LIMITS = {
 
 LIMITS = {
     "CRYPTOCAP:USDT.D": {"lower": 3.0, "upper": 7.0},
-    "CRYPTOCAP:BTC.D": {"lower": 40.0, "upper": 70.0}
+    "CRYPTOCAP:BTC.D":  {"lower": 40.0, "upper": 70.0}
 }
 
+# Aynı kapanışı tekrarlamamak için toleranslar
+INTERVAL_DUPLICATE_CHECK = {
+    "15m": timedelta(minutes=12),                      # 12 dk
+    "1h":  timedelta(minutes=53, seconds=30),          # 53 dk 30 sn
+    "4h":  timedelta(hours=3, minutes=50, seconds=15), # 3 sa 50 dk 15 sn
+    "1d":  timedelta(hours=23, minutes=50, seconds=45) # 23 sa 50 dk 45 sn
+}
 
-def load_telegram_config(config_path):
+# ─────────────────────────────────────────────────────────────
+# 4) Yardımcı: Telegram konfig yükleyici (iki şemayı da destekler)
+# ─────────────────────────────────────────────────────────────
+def load_telegram_config(config_path: str) -> dict:
     """
-    Telegram yapılandırmasını bir JSON dosyasından yükler ve doğrulama yapar.
-
-    Args:
-        config_path (str): Yükleme yapılacak yapılandırma dosyasının yolu.
-
-    Returns:
-        dict: Bot yapılandırmalarını içeren bir sözlük. Anahtar olarak bot isimlerini, değer olarak ise
-        "token" ve "chat_id" bilgilerini içerir.
-
-    Raises:
-        FileNotFoundError: Eğer yapılandırma dosyası bulunamazsa.
-        json.JSONDecodeError: Eğer yapılandırma dosyası geçersiz JSON formatında ise.
-        KeyError: Eğer dosyada beklenen anahtarlar eksikse.
-        ValueError: Eğer "main_bot" yapılandırması eksikse.
+    Desteklenen formatlar:
+    A) {
+         "bots": [
+           {"name":"main_bot","token":"XXX","chat_id":"111"},
+           {"name":"alerts_bot","token":"YYY","chat_id":"222"}
+         ]
+       }
+    B) {
+         "main_bot":   {"token":"XXX","chat_id":"111"},
+         "alerts_bot": {"token":"YYY","chat_id":"222"}
+       }
     """
-    try:
-        # Dosyayı aç ve JSON içeriğini yükle
-        with open(config_path, "r") as file:
-            config = json.load(file)
+    with open(config_path, "r", encoding="utf-8") as file:
+        raw = json.load(file)
 
-        # "bots" anahtarının varlığını kontrol et
-        if "bots" not in config:
-            raise KeyError("'bots' key is missing in the configuration file.")
+    bots: dict = {}
 
-        # Bot yapılandırmalarını sözlük formatında düzenle
-        bots = {
-            bot["name"]: {"token": bot["token"], "chat_id": bot["chat_id"]}
-            for bot in config["bots"]
-        }
+    # A) Üstte "bots" anahtarıyla liste
+    if isinstance(raw, dict) and isinstance(raw.get("bots"), list):
+        for b in raw["bots"]:
+            if not isinstance(b, dict):
+                continue
+            name   = b.get("name")
+            token  = b.get("token")
+            chatid = b.get("chat_id")
+            if name and token and chatid:
+                bots[name] = {"token": token, "chat_id": str(chatid)}
+            else:
+                logging.warning(f"Geçersiz bot girdisi atlandı: {b!r}")
 
-        # "main_bot" anahtarının mevcut olup olmadığını kontrol et
-        if not bots.get("main_bot"):
-            raise ValueError("Bot configuration for 'main_bot' not found.")
+    # B) Ad → yapı sözlüğü
+    elif isinstance(raw, dict):
+        for name, vals in raw.items():
+            if isinstance(vals, dict) and "token" in vals and "chat_id" in vals:
+                bots[name] = {"token": vals["token"], "chat_id": str(vals["chat_id"])}
 
-        logging.info("Telegram configuration loaded successfully.")
-        return bots
+    # C) Düz liste
+    elif isinstance(raw, list):
+        for b in raw:
+            if not isinstance(b, dict):
+                continue
+            name   = b.get("name")
+            token  = b.get("token")
+            chatid = b.get("chat_id")
+            if name and token and chatid:
+                bots[name] = {"token": token, "chat_id": str(chatid)}
 
-    except FileNotFoundError:
-        logging.error(f"Configuration file not found: {config_path}")
-        raise
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding configuration file: {e}")
-        raise
-    except KeyError as e:
-        logging.error(f"Missing expected key in Telegram configuration: {e}")
-        raise
-    except ValueError as e:
-        logging.error(f"Invalid configuration: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Unexpected error loading Telegram configuration: {e}")
-        raise
+    if not bots:
+        raise ValueError("Telegram config okunamadı veya geçersiz format.")
 
+    if "main_bot" not in bots:
+        logging.warning("Telegram config içinde 'main_bot' yok (opsiyonel uyarı).")
 
+    logging.info("Telegram configuration loaded successfully.")
+    return bots
 
+# ─────────────────────────────────────────────────────────────
+# 6) GİRİŞ NOKTASI
+# ─────────────────────────────────────────────────────────────
 
 # Telegram mesaj gönderme fonksiyonu
 def send_telegram_message(message: str, bot_name: str, bots: dict, retries: int = 3, timeout: int = 10):
@@ -215,19 +242,36 @@ def send_startup_info():
         logging.error(f"Failed to send startup info: {e}")
 
 
-def connect_db():
+def connect_db(db_path: str | None = None):
     """
-    Veritabanına bağlanır ve bağlantı nesnesi döndürür.
+    SQLite veritabanına bağlanır, güvenli PRAGMA'ları ayarlar ve (conn, cursor) döner.
+    Hata halinde ConnectionError raise eder; Telegram bildirimi dışarıda yapılır.
     """
     try:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        cursor = conn.cursor()
-        return conn, cursor
-    except Exception as e:
-        logging.error(f"Error connecting to database: {e}")
-        send_telegram_message(f"Error connecting to database: {e}", "main_bot", bots)
+        path = db_path or DB_NAME  # DB_NAME tepedeki sabitten geliyor
+        # Dizin yoksa oluştur
+        Path(Path(path).parent).mkdir(parents=True, exist_ok=True)
 
-        return None, None
+        conn = sqlite3.connect(
+            path,
+            timeout=30,             # yoğun I/O'da bekleme
+            isolation_level=None,   # autocommit; istersen "DEFERRED" yapabilirsin
+            check_same_thread=False # asyncio/thread kullanımında güvenli
+        )
+        cursor = conn.cursor()
+
+        # Performans/güvenlik için yaygın PRAGMA'lar
+        cursor.execute("PRAGMA journal_mode = WAL;")
+        cursor.execute("PRAGMA synchronous = NORMAL;")
+        cursor.execute("PRAGMA foreign_keys = ON;")
+
+        logging.info("SQLite connected: %s", path)
+        return conn, cursor
+
+    except Exception as e:
+        logging.error("DB connection error: %s", e, exc_info=True)
+        raise ConnectionError(f"Database open failed: {e}") from e
+
 
 def create_global_tables(cursor):
     """
@@ -435,104 +479,151 @@ def check_price_limits(symbol, price, bots):
 
 
 
-async def fetch_multiple_prices(symbols, retries=3, delay_between_requests=1):
+async def fetch_multiple_prices(
+    symbols: List[str],
+    retries: int = 3,
+    delay_between_requests: int = 1,
+    notify_failures: bool = False,
+    bots: Optional[Dict[str, Any]] = None,
+    bot_name: str = "alerts_bot",
+    chromedriver_path: str = "/usr/bin/chromedriver",
+    timeout_sec: int = 30,
+    concurrency: int = 1,                 # JSON: selenium_pool.size
+    use_user_data_dir: bool = True,       # profil çakışırsa otomatik False'a düşer
+    profile_base_dir: Optional[str] = None,  # ENV/varsayılanla belirlenir
+) -> Dict[str, Optional[float]]:
     """
-    Fetch live prices for multiple symbols asynchronously.
-
-    Args:
-        symbols (list): List of symbols to fetch prices for.
-        retries (int): Number of retry attempts for each symbol.
-        delay_between_requests (int): Delay between symbol fetches in seconds.
-
-    Returns:
-        dict: A dictionary mapping symbols to their fetched prices or None if fetching failed.
+    Birden fazla sembol için fiyatları eşzamanlı çeker.
+    - Varsayılan: Her görev için benzersiz --user-data-dir ve farklı debug port (profil kilidi hatasını önler).
+    - Eğer 'user data directory is already in use' hatası alınırsa o sembol için PROFİLSİZ moda otomatik düşer.
+    - retry/backoff, timeout, concurrency parametreleri desteklenir.
+    - notify_failures=True ve bots verilirse başarısızlıklar Telegram'a bildirilir.
     """
-    semaphore = asyncio.Semaphore(5)  # Limit concurrent tasks to 5
+    # Profil kök dizini (systemd altında /tmp izolasyonundan kaçınmak için /opt kullan)
+    base_dir = (
+        profile_base_dir
+        or os.getenv("CHROME_PROFILE_BASE")
+        or "/opt/tradebot/tmp/chrome-profiles"
+    )
+    try:
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        # Dizini oluşturamıyorsak profil kullanmayalım
+        logging.warning(f"Profile base dir not usable ({base_dir}): {e}; falling back to no profile.")
+        use_user_data_dir = False
 
-    async def fetch_with_limit(symbol, driver):
-        """
-        Fetch the live price for a single symbol with retry and delay.
+    semaphore = asyncio.Semaphore(max(1, concurrency))
 
-        Args:
-            symbol (str): Trading symbol (e.g., "BTCUSD").
-            driver: Shared WebDriver instance.
-
-        Returns:
-            float or None: Fetched price as float, or None if fetching failed.
-        """
+    async def fetch_with_limit(symbol: str) -> Optional[float]:
         async with semaphore:
+            tmp_profile: Optional[str] = None
+            # Bu sembol özelinde profil kullanılsın mı? (hata olursa False'a çekilecek)
+            local_use_profile = use_user_data_dir
+
             for attempt in range(retries):
+                driver = None
                 try:
+                    options = Options()
+                    # Klasik headless çoğu sistemde daha uyumlu (gerekirse 'new' kullanılabilir)
+                    options.add_argument("--headless")
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+                    options.add_argument("--disable-gpu")
+                    options.add_argument("--disable-extensions")
+                    options.add_argument("--disable-application-cache")
+                    options.add_argument("--disable-blink-features=AutomationControlled")
+                    options.add_argument("--no-first-run")
+                    options.add_argument("--no-default-browser-check")
+                    options.add_argument("--disable-background-networking")
+                    options.add_argument("--metrics-recording-only")
+                    options.add_argument("--mute-audio")
+                    options.add_argument("--hide-scrollbars")
+                    options.add_argument("--log-level=3")
+                    # Debug port çakışmasını önle
+                    options.add_argument("--remote-debugging-port=0")
+
+                    tmp_profile = None
+                    if local_use_profile:
+                        # Her denemede benzersiz profil
+                        tmp_profile = tempfile.mkdtemp(
+                            prefix=f"tv-{symbol.replace(':','-')}-", dir=base_dir
+                        )
+                        options.add_argument(f"--user-data-dir={tmp_profile}")
+
+                    service = Service(chromedriver_path)
+                    driver = webdriver.Chrome(service=service, options=options)
+
                     url = f"https://www.tradingview.com/symbols/{symbol.replace(':', '-')}/"
-                    logging.info(f"Fetching price for {symbol} (Attempt {attempt + 1}/{retries})")
+                    logging.info(
+                        f"[{symbol}] try {attempt+1}/{retries} | "
+                        f"profile={'on' if local_use_profile else 'off'} "
+                        f"| base={base_dir if local_use_profile else '-'}"
+                    )
                     driver.get(url)
 
-                    # Wait for the price element to be located
-                    price_element = WebDriverWait(driver, 30).until(
+                    price_element = WebDriverWait(driver, timeout_sec).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, ".js-symbol-last"))
                     )
-                    raw_price = price_element.text
-
-                    # Check if the price is empty or invalid
-                    if not raw_price.strip():
-                        logging.warning(f"Fetched price for {symbol} is empty. Retrying...")
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                        continue
-
-                    logging.info(f"Fetched raw price for {symbol}: {raw_price}")
-
-                    # Clean and return the price
-                    cleaned_price = clean_price_string(raw_price)
-                    if cleaned_price is None:
-                        logging.warning(f"Price cleaning failed for {symbol}. Retrying...")
+                    raw_price = (price_element.text or "").strip()
+                    if not raw_price:
+                        logging.warning(f"[{symbol}] empty price; retrying…")
                         await asyncio.sleep(2 ** attempt)
                         continue
 
-                    return cleaned_price
+                    logging.info(f"[{symbol}] raw price: {raw_price}")
+                    cleaned = clean_price_string(raw_price)
+                    if cleaned is None:
+                        logging.warning(f"[{symbol}] cleaning failed; retrying…")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+                    return cleaned
+
+                except WebDriverException as e:
+                    msg = str(e)
+                    logging.error(f"[{symbol}] WebDriverException ({attempt+1}/{retries}): {msg}")
+                    # Profil kilidi hatası → bu sembolde profili kapatıp yeniden dene
+                    if "user data directory is already in use" in msg.lower() and local_use_profile:
+                        logging.warning(f"[{symbol}] user-data-dir in use → switching to NO-PROFILE mode.")
+                        local_use_profile = False
+                    await asyncio.sleep(2 ** attempt)
 
                 except Exception as e:
-                    logging.error(f"Error fetching price for {symbol}, Attempt {attempt + 1}/{retries}: {e}")
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff for retries
+                    logging.error(f"[{symbol}] fetch error ({attempt+1}/{retries}): {e}")
+                    await asyncio.sleep(2 ** attempt)
 
-            logging.error(f"Failed to fetch price for {symbol} after {retries} attempts.")
+                finally:
+                    if driver:
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                    if tmp_profile:
+                        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+            # Tüm denemeler başarısız
+            error_message = f"Failed to fetch price for {symbol} after {retries} attempts."
+            logging.error(error_message)
+            if notify_failures and bots:
+                try:
+                    send_telegram_message(error_message, bot_name, bots)
+                except Exception:
+                    logging.warning("[fetch_multiple_prices] Telegram notification failed.")
             return None
 
-    # Initialize Chrome WebDriver
-    options = Options()
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--headless')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--disable-application-cache')
-    options.add_argument('--disable-blink-features=AutomationControlled')
+    tasks = {sym: fetch_with_limit(sym) for sym in symbols}
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-    service = Service("/usr/bin/chromedriver")
-    driver = webdriver.Chrome(service=service, options=options)
+    out: Dict[str, Optional[float]] = {}
+    for sym, res in zip(tasks.keys(), results):
+        if isinstance(res, Exception):
+            logging.error(f"[{sym}] task exception: {res}")
+            out[sym] = None
+        else:
+            out[sym] = res
 
-    try:
-        # Create tasks for fetching prices
-        tasks = {symbol: fetch_with_limit(symbol, driver) for symbol in symbols}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-        # Map symbols to their results
-        fetched_prices = {}
-        for symbol, result in zip(tasks.keys(), results):
-            if isinstance(result, Exception):
-                logging.error(f"Error with {symbol}: {result}")
-                fetched_prices[symbol] = None
-            else:
-                fetched_prices[symbol] = result
-
-        return fetched_prices
-
-    finally:
-        driver.quit()  # Ensure driver is closed after execution
-        logging.info("Chrome driver closed.")
-
-
-
-
+    await asyncio.sleep(delay_between_requests)
+    return out
 
 
 
@@ -675,19 +766,19 @@ async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
         # Handle database constraints (e.g., UNIQUE constraint violations)
         conn.rollback()
         logging.warning(f"Integrity error while saving live data for {symbol}: {e}")
-        send_telegram_message(f"⚠️ Integrity error: Could not save data for {symbol}.")
+        send_telegram_message(f"⚠️ Integrity error: Could not save data for {symbol}.", "alerts_bot", bots)
 
     except sqlite3.OperationalError as e:
         # Handle operational issues with the database
         conn.rollback()
         logging.error(f"Operational error while saving live data for {symbol}: {e}")
-        send_telegram_message(f"⚠️ Database error: Could not save data for {symbol}.")
+        send_telegram_message(f"⚠️ Database error: Could not save data for {symbol}.", "alerts_bot", bots)
 
     except Exception as e:
         # Handle other exceptions
         conn.rollback()
         logging.error(f"Unexpected error saving live data for {symbol}: {e}")
-        send_telegram_message(f"❌ Unexpected error: Could not save data for {symbol}. Error: {str(e)}")
+        send_telegram_message(f"❌ Unexpected error: Could not save data for {symbol}. Error: {str(e)}", "alerts_bot", bots)
 
     finally:
         # Log the completion of the operation, even if it fails
@@ -802,100 +893,6 @@ def get_latest_live_data(cursor, symbol):
     return None
 
 
-async def fetch_multiple_prices(symbols, retries=3, delay_between_requests=1, notify_failures=False):
-    """
-    Birden fazla sembol için fiyatları eşzamanlı olarak çeker.
-
-    Args:
-        symbols (list): Çekilecek semboller listesi.
-        retries (int): Hata durumunda tekrar deneme sayısı.
-        delay_between_requests (int): Talepler arasında gecikme süresi (saniye).
-        notify_failures (bool): Başarısızlık durumlarında Telegram bildirimi yapılacak mı.
-
-    Returns:
-        dict: Sembol-fiyat eşlemesini içeren bir sözlük.
-    """
-    semaphore = asyncio.Semaphore(5)  # Maksimum 5 paralel işlem
-
-    async def fetch_with_limit(symbol):
-        """
-        Tek bir sembol için fiyat alımı.
-        """
-        async with semaphore:
-            driver = None
-            for attempt in range(retries):
-                try:
-                    # ChromeDriver seçeneklerini tanımla
-                    options = Options()
-                    options.add_argument('--no-sandbox')
-                    options.add_argument('--disable-dev-shm-usage')
-                    options.add_argument('--headless')
-                    options.add_argument('--disable-gpu')
-                    options.add_argument('--disable-extensions')
-                    options.add_argument('--disable-application-cache')
-                    options.add_argument('--disable-blink-features=AutomationControlled')
-                    options.add_argument('--log-level=3')
-
-                    service = Service("/usr/bin/chromedriver")
-                    driver = webdriver.Chrome(service=service, options=options)
-
-                    # TradingView sayfasına git
-                    url = f"https://www.tradingview.com/symbols/{symbol.replace(':', '-')}/"
-                    logging.info(f"Fetching price for {symbol} (Attempt {attempt + 1}/{retries})")
-                    driver.get(url)
-
-                    # Fiyat öğesini bekle ve al
-                    price_element = WebDriverWait(driver, 30).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, ".js-symbol-last"))
-                    )
-                    raw_price = price_element.text
-                    logging.info(f"Fetched raw price for {symbol}: {raw_price}")
-
-                    # Fiyatı temizle ve döndür
-                    cleaned_price = clean_price_string(raw_price)
-                    if cleaned_price is None:
-                        raise ValueError(f"Invalid price fetched for {symbol}: {raw_price}")
-
-                    return cleaned_price
-
-                except Exception as e:
-                    logging.error(f"Error fetching price for {symbol}, Attempt {attempt + 1}/{retries}: {e}")
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-
-                finally:
-                    if driver:
-                        driver.quit()
-                        logging.info(f"Chrome driver closed for {symbol}.")
-
-            # Tüm denemeler başarısız olursa None döndür
-            error_message = f"Failed to fetch price for {symbol} after {retries} attempts."
-            logging.error(error_message)
-            if notify_failures:
-                send_telegram_message(error_message)
-            return None
-
-    # Paralel görevler oluştur ve çalıştır
-    tasks = {symbol: fetch_with_limit(symbol) for symbol in symbols}
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-    # Sembol-fiyat eşlemesi oluştur
-    fetched_prices = {}
-    for symbol, result in zip(tasks.keys(), results):
-        if isinstance(result, Exception):
-            logging.error(f"Error with {symbol}: {result}")
-            fetched_prices[symbol] = None
-        else:
-            fetched_prices[symbol] = result
-
-    # İşlemler arasında gecikme uygulayın
-    await asyncio.sleep(delay_between_requests)
-
-    return fetched_prices
-
-
-
-
-
 async def fetch_live_price(symbol: str, retries: int = 3, timeout: int = 30) -> float:
     options = Options()
     options.add_argument('--no-sandbox')
@@ -963,8 +960,7 @@ def cleanup_zombie_chrome():
     except Exception as e:
         # Log unexpected errors during cleanup
         logging.error(f"Error while cleaning zombie Chrome processes: {e}")
-        send_telegram_message(f"⚠️ Error cleaning Chrome processes: {str(e)}")
-
+        send_telegram_message(f"⚠️ Error cleaning Chrome processes: {str(e)}", "alerts_bot", bots)
 
 
 
@@ -982,7 +978,10 @@ def reconnect_db(conn, cursor):
 lock = asyncio.Lock()
 last_cleanup_time = datetime.now()
 
-async def run_fetching_cycle(conn, cursor, global_symbols, delay_between_symbols=2, cleanup_interval=1800, min_cycle_duration=30):
+
+async def run_fetching_cycle(conn, cursor, global_symbols, bots, delay_between_symbols=2, cleanup_interval=1800, min_cycle_duration=30):
+    ...
+
     """
     Paralel veri alımı ve veri işleme döngüsü.
 
@@ -1043,17 +1042,17 @@ async def run_fetching_cycle(conn, cursor, global_symbols, delay_between_symbols
                         except Exception as process_error:
                             # Veri işleme sırasında oluşan hatalar
                             logging.error(f"Error processing data for {symbol}: {process_error}")
-                            send_telegram_message(f"⚠️ Veri işleme hatası: {symbol}\nHata: {str(process_error)}")
+                            send_telegram_message(f"⚠️ Veri işleme hatası: {symbol}\nHata: {str(process_error)}", "alerts_bot", bots)
                 else:
                     # Fiyat alınamayan semboller için log ve bildirim
                     error_message = f"Failed to fetch live price for {symbol}."
                     logging.error(error_message)
-                    send_telegram_message(f"⚠️ {error_message}")
+                    send_telegram_message(f"⚠️ {error_message}", "alerts_bot", bots)
 
         except Exception as e:
             # Döngü genelindeki hatalar
             logging.error(f"Error in fetching cycle: {e}")
-            send_telegram_message(f"❌ Veri Kaydı Hatası: Hata: {str(e)}")
+            send_telegram_message(f"❌ Veri Kaydı Hatası: Hata: {str(e)}", "alerts_bot", bots)
 
         # Döngünün kalan süresini bekle
         cycle_duration = time.time() - cycle_start
@@ -1065,132 +1064,186 @@ async def run_fetching_cycle(conn, cursor, global_symbols, delay_between_symbols
         if time_since_last_action > 300:  # 5 dakikalık inaktiflik süresi
             warning_message = f"⚠️ Uyarı: Bot 5 dakikadır işlem yapmıyor. Son işlem zamanı: {last_action_time}"
             logging.warning(warning_message)
-            send_telegram_message(warning_message)
+            send_telegram_message(warning_message, "alerts_bot", bots)
 
         await asyncio.sleep(sleep_duration)
 
+async def main_trading(
+    symbols: list,
+    bots: dict,
+    conn,
+    cursor,
+    fetch_cfg: dict,
+    pool_cfg: dict,
+):
+    """
+    Semboller için fiyatları çeker, limit kontrolü yapar ve DB'ye kaydeder.
+    Çalışma parametreleri JSON config'ten (fetch_cfg / pool_cfg) gelir.
+    """
+    # JSON → çalışma parametreleri
+    retries           = int(fetch_cfg.get("retries", 3))
+    timeout_sec       = int(fetch_cfg.get("wait_seconds", 30))
+    fetch_every_sec   = int(fetch_cfg.get("fetch_every_sec", 60))
+    concurrency       = max(1, int(pool_cfg.get("size", 1)))
+    chromedriver_path = pool_cfg.get("chromedriver_path", "/usr/bin/chromedriver")
 
-async def main_trading():
-    """
-    Ana işlem döngüsü: Semboller JSON dosyasından yüklenir, fiyatlar kontrol edilir ve veriler işlenir.
-    """
+    # Bildirim tercihleri
+    notify_failures = True
+    bot_name = "alerts_bot" if isinstance(bots, dict) and "alerts_bot" in bots else "main_bot"
+
+    # Başlatma mesajı (opsiyonel)
     try:
-        # Telegram yapılandırmasını yükle
-        telegram_config_path = "/opt/tradebot/globalislemler/config/telegram_bots.json"
-        bots = load_telegram_config(telegram_config_path)
-
-        # Sembolleri JSON dosyasından yükle
-        symbols_file_path = "/opt/tradebot/globalislemler/config/global_data_config.json"
-        with open(symbols_file_path, "r") as file:
-            config = json.load(file)
-
-        # global_symbols anahtarını al
-        symbols = config.get("global_symbols", [])
-        if not symbols:
-            raise ValueError("No symbols found in the 'global_symbols' key of symbols.json.")
-
-        logging.info(f"Loaded symbols for trading: {symbols}")
-
-        # Başlatma mesajını gönder
         script_path = os.path.abspath(__file__)
-        db_name = DB_NAME
         message = (
             "✅ <b>Program Başlatıldı</b>\n\n"
             f"📂 <b>Dosya Adı:</b> {os.path.basename(script_path)}\n"
             f"📁 <b>Dosya Konumu:</b> {script_path}\n"
-            f"🗃️ <b>Veritabanı Adı:</b> {db_name}\n"
-            f"📊 <b>Tablo İsimleri:</b>\n"
-            f"  - Canlı Veriler: {GLOBAL_LIVE_TABLE}\n"
-            f"  - Kapanış Verileri: {GLOBAL_CLOSING_TABLE}\n"
+            f"🗃️ <b>Veritabanı:</b> {DB_NAME}\n"
+            f"📊 <b>Tablolar:</b>\n"
+            f"  - Canlı: {GLOBAL_LIVE_TABLE}\n"
+            f"  - Kapanış: {GLOBAL_CLOSING_TABLE}\n"
         )
-        send_telegram_message(message, "main_bot", bots)
+        if bots:
+            send_telegram_message(message, "main_bot", bots)
+    except Exception:
+        logging.warning("Başlatma mesajı gönderilemedi.", exc_info=True)
 
-        # Ana döngü
-        while True:
-            try:
-                # Fiyatları al
-                prices = await fetch_multiple_prices(symbols)
-                for symbol, price in prices.items():
-                    if price is not None:
-                        # Sadece tanımlı semboller için limit kontrolü yap
-                        if symbol in LIMITS:
-                            check_price_limits(symbol, price, bots)
+    # Sürekli döngü
+    while True:
+        try:
+            # Fiyatları çek
+            prices = await fetch_multiple_prices(
+                symbols,
+                retries=retries,
+                delay_between_requests=1,       # kısa ara (isteğe bağlı)
+                notify_failures=notify_failures,
+                bots=bots,
+                bot_name=bot_name,
+                chromedriver_path=chromedriver_path,
+                timeout_sec=timeout_sec,
+                concurrency=concurrency,
+            )
 
-                        # Veritabanına canlı veri ve kapanış fiyatlarını kaydet
-                        changes = calculate_changes(cursor, symbol, price)
-                        await save_live_data(cursor, conn, symbol, price, changes)
-                        await save_closing_price(cursor, conn, symbol, price)
-                    else:
-                        logging.warning(f"Price for {symbol} could not be fetched.")
+            now = datetime.now(timezone.utc)
 
-                await asyncio.sleep(60)  # Döngü bekleme süresi
+            for symbol, price in prices.items():
+                if price is None:
+                    logging.warning(f"Price for {symbol} could not be fetched.")
+                    continue
 
-            except Exception as e:
-                logging.error(f"Error in main_trading loop: {e}")
-                send_telegram_message(f"❌ Error in main_trading loop: {str(e)}", "main_bot", bots)
+                # Limit kontrolü (yalnızca tanımlı semboller)
+                if symbol in LIMITS:
+                    check_price_limits(symbol, price, bots)
 
-    except FileNotFoundError as e:
-        logging.error(f"Configuration or symbols file not found: {e}")
-        send_telegram_message(f"❌ Configuration or symbols file not found: {e}", "main_bot", bots if 'bots' in locals() else {})
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding symbols.json: {e}")
-        send_telegram_message(f"❌ Error decoding symbols.json: {e}", "main_bot", bots if 'bots' in locals() else {})
-    except Exception as e:
-        logging.error(f"Fatal error in main_trading: {e}")
-        send_telegram_message(f"❌ Fatal error in main_trading: {str(e)}", "main_bot", bots if 'bots' in locals() else {})
+                # Yüzde değişimleri hesapla & kaydet
+                changes = calculate_changes(cursor, symbol, price)
+                await save_live_data(cursor, conn, symbol, price, changes, now)
+                await save_closing_price(cursor, conn, symbol, price, now)
+
+            # Döngü beklemesi: JSON'dan
+            await asyncio.sleep(fetch_every_sec)
+
+        except Exception as e:
+            logging.error(f"Error in main_trading loop: {e}", exc_info=True)
+            if bots:
+                try:
+                    send_telegram_message(f"❌ Error in main_trading loop: {str(e)}", "main_bot", bots)
+                except Exception:
+                    logging.warning("Telegram bildirimi gönderilemedi (loop error).")
 
 
 # Ana giriş noktası
 if __name__ == "__main__":
-    from pathlib import Path
-
-    BASE = Path(__file__).resolve().parent
-    CFG_DIR = BASE / "config"
-    TELEGRAM_CFG = CFG_DIR / "telegram_bots.json"
-    GLOBAL_CFG = CFG_DIR / "global_data_config.json"
-
-    bots = {}  # fail-open: telegram yoksa da servis çalışsın
+    bots = {}     # Telegram config okunamazsa bile servis çalışsın
     conn = None
     cursor = None
 
     try:
-        # Telegram yapılandırmasını yükle (opsiyonel)
+        # 6.1) Global konfigürasyonu oku (tek kaynak)
+        with open(GLOBAL_CFG, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            fetch_cfg = cfg.get("fetch", {})
+            pool_cfg  = cfg.get("selenium_pool", {})
+        # 6.2) Log seviyesi (basicConfig sonrası level güncellenebilir)
+        level_name = (cfg.get("logging_level") or "INFO").upper()
+        logging.getLogger().setLevel(getattr(logging, level_name, logging.INFO))
+
+        # 6.3) Paths override (ENV > JSON > defaults mantığı: ENV zaten en başta uygulandı)
+        paths = cfg.get("paths") or {}
+        db_override  = paths.get("db_path")
+        log_override = paths.get("log_dir")
+        telegram_cfg_override = paths.get("telegram_config")
+
+        if db_override and db_override != DB_NAME:
+            DB_NAME = db_override
+            Path(Path(DB_NAME).parent).mkdir(parents=True, exist_ok=True)
+            logging.info(f"DB_PATH override edildi: {DB_NAME}")
+
+        if log_override and os.path.abspath(log_override) != os.path.abspath(LOG_DIR):
+            Path(log_override).mkdir(parents=True, exist_ok=True)
+            logging.info(f"LOG_DIR (JSON) tespit edildi: {log_override} (handler runtime'da değiştirilmedi)")
+
+        if telegram_cfg_override and os.path.abspath(telegram_cfg_override) != os.path.abspath(TELEGRAM_CFG):
+            TELEGRAM_CFG = telegram_cfg_override
+            logging.info(f"TELEGRAM_CFG override edildi: {TELEGRAM_CFG}")
+
+        # 6.4) Telegram yapılandırmasını yükle (opsiyonel)
         try:
-            bots = load_telegram_config(str(TELEGRAM_CFG))
+            bots = load_telegram_config(TELEGRAM_CFG)
         except FileNotFoundError:
-            logging.warning(f"Telegram config bulunamadı, devam ediliyor: {TELEGRAM_CFG}")
+            logging.warning(f"Telegram config bulunamadı, devam: {TELEGRAM_CFG}")
             bots = {}
         except PermissionError:
             logging.error(f"Telegram config izin hatası, Telegram devre dışı: {TELEGRAM_CFG}")
             bots = {}
-        except Exception as e:
+        except Exception:
             logging.exception("Telegram config yüklenemedi, Telegram devre dışı")
             bots = {}
 
-        # Veritabanı bağlantısını oluştur
+        # 6.5) Veritabanı bağlantısı + tablolar
         conn, cursor = connect_db()
         if not conn or not cursor:
             raise ConnectionError("Failed to connect to the database.")
 
-        # Veritabanı tablolarını oluştur
         create_global_tables(cursor)
         conn.commit()
 
-        # Başlatma mesajı (isteğe bağlı)
-        # if bots: send_telegram_message("✅ Program başarıyla başlatıldı.", "main_bot", bots)
-
-        # Sembolleri yükle (tek kaynak: global_data_config.json)
-        with open(GLOBAL_CFG, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        global_symbols = cfg.get("symbols", [])
+        # 6.6) Semboller (symbols veya global_symbols anahtarını destekle)
+        global_symbols = cfg.get("symbols") or cfg.get("global_symbols") or []
         if not global_symbols:
-            raise ValueError("No symbols found in the 'symbols' key of the global_data_config.json file.")
-
+            raise ValueError(
+                "No symbols found. Lütfen global_data_config.json içinde "
+                "'symbols' veya 'global_symbols' anahtarını doldurun."
+            )
         logging.info(f"Loaded global symbols: {global_symbols}")
 
-        # Ana işlem döngüsünü başlat (sembolleri aktar!)
-        asyncio.run(main_trading(global_symbols))
+        # 6.7) Price limits (JSON varsa sabiti güncelle)
+        if "price_limits" in cfg and isinstance(cfg["price_limits"], dict):
+            LIMITS.clear()
+            LIMITS.update(cfg["price_limits"])
+
+        # 6.8) Retention: hem doğru tablo adlarını hem olası kısa adları destekle
+        # JSON önerilen: {"global_live_data":5000,"global_closing_data":8000}
+        # Eski alışkanlık için destek: {"global_live":5000,"global_closing":8000}
+        if "retention" in cfg and isinstance(cfg["retention"], dict):
+            mapping = {
+                "global_live": GLOBAL_LIVE_TABLE,
+                "global_closing": GLOBAL_CLOSING_TABLE,
+                GLOBAL_LIVE_TABLE: GLOBAL_LIVE_TABLE,
+                GLOBAL_CLOSING_TABLE: GLOBAL_CLOSING_TABLE,
+            }
+            for key, limit in cfg["retention"].items():
+                table = mapping.get(key)
+                if table:
+                    try:
+                        RECORD_LIMITS[table] = int(limit)
+                    except Exception:
+                        logging.warning(f"Retention değeri sayıya çevrilemedi: {key} -> {limit}")
+                else:
+                    logging.warning(f"Bilinmeyen retention anahtarı: {key}")
+
+        # 6.9) Ana işlem döngüsü
+        asyncio.run(main_trading(global_symbols, bots, conn, cursor, fetch_cfg, pool_cfg))
 
     except FileNotFoundError as e:
         logging.error(f"File not found: {e}", exc_info=True)
@@ -1225,7 +1278,6 @@ if __name__ == "__main__":
                 logging.warning("Telegram bildirimi gönderilemedi (Fatal).")
 
     finally:
-        # Veritabanı bağlantısını kapat
         try:
             if conn:
                 conn.close()
