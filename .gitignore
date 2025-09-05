@@ -26,7 +26,10 @@ trade_env/
 log/
 logs/
 */logs/
-global_testler/
+**/global_testler/
+**/pw-browsers/
+pw-browsers/
+
 
 # ── 4) Veritabanları (SQLite) ────────────────────────────────────────────────
 *.db
