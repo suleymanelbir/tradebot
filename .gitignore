@@ -84,3 +84,9 @@ selenium-screenshots/
 # data/
 # !data/README.md
 
+
+# Local backups
+*.bak
+# Personal notes
+yapilacaklar.txt
+globalislemler/yapilacaklar.txt

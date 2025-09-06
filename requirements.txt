@@ -1,9 +1,7 @@
 # Çekirdek bağımlılıklar
 requests>=2.31,<3
-selenium>=4.21,<5
 
-# Opsiyonel (chromedriver’ı otomatik indirmek için)
-webdriver-manager>=4,<5
+playwright>=1.41,<2
 
 # Eğer web arayüzü planlıyorsan bırak, yoksa silebilirsin
 flask

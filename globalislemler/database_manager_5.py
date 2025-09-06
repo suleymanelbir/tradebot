@@ -19,25 +19,29 @@ Logları izle: sudo journalctl -u tradebot-global.service -f
 #  alias tradebot-log='sudo journalctl -u tradebot-global.service -f'                                                       *
 #                                                                                                                           *
 # ***************************************************************************************************************************
+# 🔧 Sistem ve dosya işlemleri
 import os
 import json
 import sqlite3
 import logging
 import asyncio
 import time
-import tempfile, shutil, random
+import tempfile
+import shutil
+import random
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+# 🧠 Tip belirtimleri
 from typing import List, Dict, Optional, Any
+
+# 🌐 HTTP istekleri
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-# Kullanacaksan açık bırak; kullanmayacaksan Ruff için kaldır:
-from selenium.common.exceptions import TimeoutException, WebDriverException
+
+
+
+# 🎭 Playwright (aktif kullanım için açık bırakıldı)
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 print("✅ Script başladı")
 
@@ -155,6 +159,88 @@ def load_telegram_config(config_path: str) -> dict:
 
     logging.info("Telegram configuration loaded successfully.")
     return bots
+# ─────────────────────────────────────────────────────────────
+# playwright için kullanılan fonksiyon
+# ─────────────────────────────────────────────────────────────
+async def fetch_multiple_prices_playwright(
+    symbols: List[str],
+    retries: int = 3,
+    timeout_ms: int = 30000,
+    concurrency: int = 2,
+) -> Dict[str, Optional[float]]:
+    """
+    Playwright ile fiyatları çeker.
+    - Tek Chromium process; her sembol için izole BrowserContext.
+    - concurrency ile aynı anda kaç context/page açılacağı kontrol edilir.
+    - retry + exponential backoff desteklenir.
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--hide-scrollbars",
+            ],
+        )
+
+        async def fetch_one(sym: str) -> Optional[float]:
+            for attempt in range(retries):
+                context = None
+                page = None
+                try:
+                    async with sem:
+                        context = await browser.new_context()   # izole session
+                        page = await context.new_page()
+                        url = f"https://www.tradingview.com/symbols/{sym.replace(':','-')}/"
+                        logging.info(f"[PW:{sym}] try {attempt+1}/{retries}")
+                        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+                        # TradingView fiyatı (Selenium’da kullandığın CSS ile aynı)
+                        await page.wait_for_selector(".js-symbol-last", timeout=timeout_ms)
+                        raw = await page.text_content(".js-symbol-last")
+                        raw = (raw or "").strip()
+                        if not raw:
+                            logging.warning(f"[PW:{sym}] empty price; retrying…")
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+
+                        price = clean_price_string(raw)
+                        if price is None:
+                            logging.warning(f"[PW:{sym}] cleaning failed; retrying…")
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+
+                        return price
+
+                except (PWTimeout, Exception) as e:
+                    logging.error(f"[PW:{sym}] error (try {attempt+1}/{retries}): {e}")
+                    await asyncio.sleep(2 ** attempt)
+
+                finally:
+                    try:
+                        if page:
+                            await page.close()
+                        if context:
+                            await context.close()
+                    except Exception:
+                        pass
+
+            logging.error(f"[PW:{sym}] failed after {retries} attempts")
+            return None
+
+        results = await asyncio.gather(*(fetch_one(s) for s in symbols))
+        await browser.close()
+
+    return dict(zip(symbols, results))
+
 
 # ─────────────────────────────────────────────────────────────
 # 6) GİRİŞ NOKTASI
@@ -479,152 +565,6 @@ def check_price_limits(symbol, price, bots):
 
 
 
-async def fetch_multiple_prices(
-    symbols: List[str],
-    retries: int = 3,
-    delay_between_requests: int = 1,
-    notify_failures: bool = False,
-    bots: Optional[Dict[str, Any]] = None,
-    bot_name: str = "alerts_bot",
-    chromedriver_path: str = "/usr/bin/chromedriver",
-    timeout_sec: int = 30,
-    concurrency: int = 1,                 # JSON: selenium_pool.size
-    use_user_data_dir: bool = True,       # profil çakışırsa otomatik False'a düşer
-    profile_base_dir: Optional[str] = None,  # ENV/varsayılanla belirlenir
-) -> Dict[str, Optional[float]]:
-    """
-    Birden fazla sembol için fiyatları eşzamanlı çeker.
-    - Varsayılan: Her görev için benzersiz --user-data-dir ve farklı debug port (profil kilidi hatasını önler).
-    - Eğer 'user data directory is already in use' hatası alınırsa o sembol için PROFİLSİZ moda otomatik düşer.
-    - retry/backoff, timeout, concurrency parametreleri desteklenir.
-    - notify_failures=True ve bots verilirse başarısızlıklar Telegram'a bildirilir.
-    """
-    # Profil kök dizini (systemd altında /tmp izolasyonundan kaçınmak için /opt kullan)
-    base_dir = (
-        profile_base_dir
-        or os.getenv("CHROME_PROFILE_BASE")
-        or "/opt/tradebot/tmp/chrome-profiles"
-    )
-    try:
-        Path(base_dir).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        # Dizini oluşturamıyorsak profil kullanmayalım
-        logging.warning(f"Profile base dir not usable ({base_dir}): {e}; falling back to no profile.")
-        use_user_data_dir = False
-
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-
-    async def fetch_with_limit(symbol: str) -> Optional[float]:
-        async with semaphore:
-            tmp_profile: Optional[str] = None
-            # Bu sembol özelinde profil kullanılsın mı? (hata olursa False'a çekilecek)
-            local_use_profile = use_user_data_dir
-
-            for attempt in range(retries):
-                driver = None
-                try:
-                    options = Options()
-                    # Klasik headless çoğu sistemde daha uyumlu (gerekirse 'new' kullanılabilir)
-                    options.add_argument("--headless")
-                    options.add_argument("--no-sandbox")
-                    options.add_argument("--disable-dev-shm-usage")
-                    options.add_argument("--disable-gpu")
-                    options.add_argument("--disable-extensions")
-                    options.add_argument("--disable-application-cache")
-                    options.add_argument("--disable-blink-features=AutomationControlled")
-                    options.add_argument("--no-first-run")
-                    options.add_argument("--no-default-browser-check")
-                    options.add_argument("--disable-background-networking")
-                    options.add_argument("--metrics-recording-only")
-                    options.add_argument("--mute-audio")
-                    options.add_argument("--hide-scrollbars")
-                    options.add_argument("--log-level=3")
-                    # Debug port çakışmasını önle
-                    options.add_argument("--remote-debugging-port=0")
-
-                    tmp_profile = None
-                    if local_use_profile:
-                        # Her denemede benzersiz profil
-                        tmp_profile = tempfile.mkdtemp(
-                            prefix=f"tv-{symbol.replace(':','-')}-", dir=base_dir
-                        )
-                        options.add_argument(f"--user-data-dir={tmp_profile}")
-
-                    service = Service(chromedriver_path)
-                    driver = webdriver.Chrome(service=service, options=options)
-
-                    url = f"https://www.tradingview.com/symbols/{symbol.replace(':', '-')}/"
-                    logging.info(
-                        f"[{symbol}] try {attempt+1}/{retries} | "
-                        f"profile={'on' if local_use_profile else 'off'} "
-                        f"| base={base_dir if local_use_profile else '-'}"
-                    )
-                    driver.get(url)
-
-                    price_element = WebDriverWait(driver, timeout_sec).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, ".js-symbol-last"))
-                    )
-                    raw_price = (price_element.text or "").strip()
-                    if not raw_price:
-                        logging.warning(f"[{symbol}] empty price; retrying…")
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-                    logging.info(f"[{symbol}] raw price: {raw_price}")
-                    cleaned = clean_price_string(raw_price)
-                    if cleaned is None:
-                        logging.warning(f"[{symbol}] cleaning failed; retrying…")
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-                    return cleaned
-
-                except WebDriverException as e:
-                    msg = str(e)
-                    logging.error(f"[{symbol}] WebDriverException ({attempt+1}/{retries}): {msg}")
-                    # Profil kilidi hatası → bu sembolde profili kapatıp yeniden dene
-                    if "user data directory is already in use" in msg.lower() and local_use_profile:
-                        logging.warning(f"[{symbol}] user-data-dir in use → switching to NO-PROFILE mode.")
-                        local_use_profile = False
-                    await asyncio.sleep(2 ** attempt)
-
-                except Exception as e:
-                    logging.error(f"[{symbol}] fetch error ({attempt+1}/{retries}): {e}")
-                    await asyncio.sleep(2 ** attempt)
-
-                finally:
-                    if driver:
-                        try:
-                            driver.quit()
-                        except Exception:
-                            pass
-                    if tmp_profile:
-                        shutil.rmtree(tmp_profile, ignore_errors=True)
-
-            # Tüm denemeler başarısız
-            error_message = f"Failed to fetch price for {symbol} after {retries} attempts."
-            logging.error(error_message)
-            if notify_failures and bots:
-                try:
-                    send_telegram_message(error_message, bot_name, bots)
-                except Exception:
-                    logging.warning("[fetch_multiple_prices] Telegram notification failed.")
-            return None
-
-    tasks = {sym: fetch_with_limit(sym) for sym in symbols}
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-    out: Dict[str, Optional[float]] = {}
-    for sym, res in zip(tasks.keys(), results):
-        if isinstance(res, Exception):
-            logging.error(f"[{sym}] task exception: {res}")
-            out[sym] = None
-        else:
-            out[sym] = res
-
-    await asyncio.sleep(delay_between_requests)
-    return out
-
 
 
 def clean_symbol(symbol): 
@@ -893,77 +833,6 @@ def get_latest_live_data(cursor, symbol):
     return None
 
 
-async def fetch_live_price(symbol: str, retries: int = 3, timeout: int = 30) -> float:
-    options = Options()
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--disable-application-cache')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-
-    service = Service("/usr/bin/chromedriver")
-
-    for attempt in range(retries):
-        driver = None
-        try:
-            # Selenium driver başlatılıyor
-            logging.info(f"Fetching live price for {symbol}, attempt {attempt + 1}/{retries}")
-            driver = webdriver.Chrome(service=service, options=options)
-            url = f"https://www.tradingview.com/symbols/{symbol.replace(':', '-')}/"
-            driver.get(url)
-
-            # Fiyat bilgisini çek
-            price_element = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".js-symbol-last"))
-            )
-            raw_price = price_element.text
-            logging.info(f"Fetched raw price for {symbol}: {raw_price}")
-
-            # Fiyatı temizle ve döndür
-            return clean_price_string(raw_price)
-
-        except Exception as e:
-            logging.error(f"Error fetching price for {symbol}, attempt {attempt + 1}/{retries}: {e}")
-            if attempt == retries - 1:
-                logging.error(f"Failed to fetch price for {symbol} after {retries} attempts.")
-        finally:
-            # Selenium driver'ı kapat
-            if driver:
-                driver.quit()
-                logging.info("Chrome driver closed.")
-
-    return None
-
-def cleanup_zombie_chrome():
-    """
-    Clean up zombie Chrome processes left hanging in the system.
-    This function terminates all Chrome processes running in headless mode.
-
-    Logs:
-        - Information about the cleanup process.
-        - Warnings if no processes are found.
-        - Errors if the cleanup process fails.
-    """
-    logging.info("Starting cleanup of zombie Chrome processes...")
-
-    try:
-        # Execute the system command to kill headless Chrome processes
-        result = os.system("pkill -f 'chrome --headless'")
-        
-        if result == 0:
-            logging.info("Zombie Chrome processes cleaned successfully.")
-        else:
-            # Handle cases where no processes are found
-            logging.warning("No zombie Chrome processes found to clean.")
-
-    except Exception as e:
-        # Log unexpected errors during cleanup
-        logging.error(f"Error while cleaning zombie Chrome processes: {e}")
-        send_telegram_message(f"⚠️ Error cleaning Chrome processes: {str(e)}", "alerts_bot", bots)
-
-
-
 def reconnect_db(conn, cursor):
     """
     Veritabanı bağlantısını yeniler.
@@ -979,117 +848,138 @@ lock = asyncio.Lock()
 last_cleanup_time = datetime.now()
 
 
-async def run_fetching_cycle(conn, cursor, global_symbols, bots, delay_between_symbols=2, cleanup_interval=1800, min_cycle_duration=30):
-    ...
-
+async def run_fetching_cycle(
+    conn,
+    cursor,
+    global_symbols: list[str],
+    bots: dict,
+    delay_between_symbols: int = 2,    # DEPRECATED: Playwright ile kullanılmıyor
+    cleanup_interval: int = 1800,      # DEPRECATED: Selenium zombi temizliği yok
+    min_cycle_duration: int = 30,
+    *,
+    retries: int = 3,
+    timeout_sec: int = 30,
+    concurrency: int = 2,
+    fetch_every_sec: Optional[int] = None,
+    lock: Optional[asyncio.Lock] = None,
+) -> None:
     """
-    Paralel veri alımı ve veri işleme döngüsü.
+    Paralel veri alımı ve veri işleme döngüsü (Playwright).
 
     Args:
-        conn: Veritabanı bağlantısı.
-        cursor: Veritabanı cursor.
-        global_symbols (list): İşlem yapılacak semboller listesi.
-        delay_between_symbols (int): Semboller arasında bekleme süresi (saniye).
-        cleanup_interval (int): Zombi Chrome işlemlerini temizleme süresi (saniye).
-        min_cycle_duration (int): Döngü başına minimum süre (saniye).
+        conn: Veritabanı bağlantısı (sqlite3.Connection).
+        cursor: Veritabanı cursor (sqlite3.Cursor).
+        global_symbols: İşlem yapılacak semboller listesi.
+        bots: Telegram bot config dict (name -> {token, chat_id}).
+        delay_between_symbols: (DEPRECATED) Semboller arası bekleme (kullanılmıyor).
+        cleanup_interval: (DEPRECATED) Selenium zombi temizliği (kullanılmıyor).
+        min_cycle_duration: Geriye uyumlu minimum döngü süresi (saniye).
+    Keyword Args:
+        retries: Her sembol için deneme sayısı (Playwright toplayıcı).
+        timeout_sec: Sayfa/selektör timeout (saniye).
+        concurrency: Aynı anda açılacak context/page sayısı.
+        fetch_every_sec: Döngü aralığı; verilmezse min_cycle_duration kullanılır.
+        lock: DB yazımı için opsiyonel asyncio.Lock.
     """
-    logging.info("Fetching cycle started.")
-    last_cleanup_time = datetime.now()
-    last_action_time = datetime.now()
-    retry_attempts = 3  # Hata durumunda tekrar deneme sayısı
+    logging.info("Fetching cycle (Playwright) started.")
+    lock = lock or asyncio.Lock()
+    last_action_time = datetime.now(timezone.utc)
 
     while True:
-        cycle_start = time.time()
+        cycle_start = time.monotonic()
         try:
-            # Zombi Chrome temizliği
-            if (datetime.now() - last_cleanup_time).total_seconds() > cleanup_interval:
-                logging.info("Performing scheduled cleanup of zombie Chrome processes.")
-                cleanup_zombie_chrome()
-                last_cleanup_time = datetime.now()
-
-            # Paralel fiyat alma
-            logging.info("Fetching live prices for symbols...")
-            for attempt in range(retry_attempts):
-                try:
-                    fetched_prices = await fetch_multiple_prices(global_symbols, delay_between_requests=delay_between_symbols)
-                    break  # Başarılı olursa döngüden çık
-                except Exception as fetch_error:
-                    logging.warning(f"Retrying fetching prices. Attempt {attempt + 1}/{retry_attempts}. Error: {fetch_error}")
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                # Tüm denemeler başarısız olduysa
-                raise RuntimeError("Failed to fetch prices after multiple attempts.")
+            # --- Fiyatları çek (Playwright) ---
+            fetched_prices = await fetch_multiple_prices_playwright(
+                symbols=global_symbols,
+                retries=retries,
+                timeout_ms=timeout_sec * 1000,
+                concurrency=concurrency,
+            )
 
             now = datetime.now(timezone.utc)
-            last_action_time = datetime.now()
+            last_action_time = now
 
+            # --- Kayıt akışı ---
             for symbol, live_price in fetched_prices.items():
                 if live_price is not None and live_price > 0:
                     async with lock:
                         try:
-                            # Yüzde değişimleri hesapla
-                            logging.debug(f"Calculating changes for {symbol} with live price {live_price}.")
                             changes = calculate_changes(cursor, symbol, live_price)
-
-                            # Canlı fiyatı ve değişimleri kaydet
                             await save_live_data(cursor, conn, symbol, live_price, changes, now)
-
-                            # Kapanış fiyatını kaydet
                             await save_closing_price(cursor, conn, symbol, live_price, now)
-
-                            logging.info(f"Processed data for {symbol}: Live Price: {live_price}, Changes: {changes}")
-
+                            logging.info(f"Processed {symbol}: price={live_price}, changes={changes}")
                         except Exception as process_error:
-                            # Veri işleme sırasında oluşan hatalar
-                            logging.error(f"Error processing data for {symbol}: {process_error}")
-                            send_telegram_message(f"⚠️ Veri işleme hatası: {symbol}\nHata: {str(process_error)}", "alerts_bot", bots)
+                            logging.error(f"Error processing {symbol}: {process_error}")
+                            try:
+                                send_telegram_message(
+                                    f"⚠️ Veri işleme hatası: {symbol}\nHata: {str(process_error)}",
+                                    "alerts_bot",
+                                    bots,
+                                )
+                            except Exception:
+                                logging.warning("Telegram bildirimi gönderilemedi (process error).")
                 else:
-                    # Fiyat alınamayan semboller için log ve bildirim
                     error_message = f"Failed to fetch live price for {symbol}."
                     logging.error(error_message)
-                    send_telegram_message(f"⚠️ {error_message}", "alerts_bot", bots)
+                    try:
+                        send_telegram_message(f"⚠️ {error_message}", "alerts_bot", bots)
+                    except Exception:
+                        logging.warning("Telegram bildirimi gönderilemedi (price missing).")
 
         except Exception as e:
-            # Döngü genelindeki hatalar
-            logging.error(f"Error in fetching cycle: {e}")
-            send_telegram_message(f"❌ Veri Kaydı Hatası: Hata: {str(e)}", "alerts_bot", bots)
+            logging.error(f"Error in fetching cycle: {e}", exc_info=True)
+            try:
+                send_telegram_message(f"❌ Veri Kaydı Hatası: {e}", "alerts_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (cycle error).")
 
-        # Döngünün kalan süresini bekle
-        cycle_duration = time.time() - cycle_start
-        sleep_duration = max(min_cycle_duration - cycle_duration, 0)
-        logging.debug(f"Cycle completed in {cycle_duration:.2f} seconds. Sleeping for {sleep_duration:.2f} seconds.")
+        # --- Döngü aralığı (fetch_every_sec tercih edilir, yoksa min_cycle_duration) ---
+        interval = fetch_every_sec if fetch_every_sec is not None else min_cycle_duration
+        elapsed = time.monotonic() - cycle_start
+        sleep_duration = max(interval - elapsed, 0.0)
+        logging.debug(f"Cycle completed in {elapsed:.2f}s. Sleeping for {sleep_duration:.2f}s.")
 
-        # Uyku modunu kontrol et
-        time_since_last_action = (datetime.now() - last_action_time).total_seconds()
-        if time_since_last_action > 300:  # 5 dakikalık inaktiflik süresi
-            warning_message = f"⚠️ Uyarı: Bot 5 dakikadır işlem yapmıyor. Son işlem zamanı: {last_action_time}"
+        # İnaktivite uyarısı (5 dk)
+        if (datetime.now(timezone.utc) - last_action_time).total_seconds() > 300:
+            warning_message = (
+                f"⚠️ Uyarı: Bot 5 dakikadır işlem yapmıyor. "
+                f"Son işlem zamanı (UTC): {last_action_time.isoformat()}"
+            )
             logging.warning(warning_message)
-            send_telegram_message(warning_message, "alerts_bot", bots)
+            try:
+                send_telegram_message(warning_message, "alerts_bot", bots)
+            except Exception:
+                logging.warning("Telegram bildirimi gönderilemedi (inactive warn).")
 
         await asyncio.sleep(sleep_duration)
 
 async def main_trading(
-    symbols: list,
+    symbols: list[str],
     bots: dict,
     conn,
     cursor,
     fetch_cfg: dict,
-    pool_cfg: dict,
-):
+) -> None:
     """
-    Semboller için fiyatları çeker, limit kontrolü yapar ve DB'ye kaydeder.
-    Çalışma parametreleri JSON config'ten (fetch_cfg / pool_cfg) gelir.
+    Semboller için fiyatları çeker, limitleri kontrol eder ve DB'ye yazar.
+    Yalnızca Playwright tabanlı toplayıcı kullanır.
+
+    Args:
+        symbols: İzlenecek semboller listesi (örn. ["CRYPTOCAP:USDT.D", ...]).
+        bots: Telegram bot yapılandırmaları (name -> {token, chat_id}).
+        conn: SQLite bağlantı nesnesi.
+        cursor: SQLite cursor nesnesi.
+        fetch_cfg: global_data_config.json içindeki "fetch" bölümü.
+            - retries (int, varsayılan: 3)
+            - timeout_sec (int, varsayılan: 30)  # wait_seconds ile geri uyum
+            - fetch_every_sec (int, varsayılan: 60)
+            - concurrency (int, varsayılan: 1)
     """
     # JSON → çalışma parametreleri
-    retries           = int(fetch_cfg.get("retries", 3))
-    timeout_sec       = int(fetch_cfg.get("wait_seconds", 30))
-    fetch_every_sec   = int(fetch_cfg.get("fetch_every_sec", 60))
-    concurrency       = max(1, int(pool_cfg.get("size", 1)))
-    chromedriver_path = pool_cfg.get("chromedriver_path", "/usr/bin/chromedriver")
-
-    # Bildirim tercihleri
-    notify_failures = True
-    bot_name = "alerts_bot" if isinstance(bots, dict) and "alerts_bot" in bots else "main_bot"
+    retries         = int(fetch_cfg.get("retries", 3))
+    timeout_sec     = int(fetch_cfg.get("timeout_sec", fetch_cfg.get("wait_seconds", 30)))
+    fetch_every_sec = int(fetch_cfg.get("fetch_every_sec", 60))
+    concurrency     = max(1, int(fetch_cfg.get("concurrency", 1)))
 
     # Başlatma mesajı (opsiyonel)
     try:
@@ -1111,16 +1001,11 @@ async def main_trading(
     # Sürekli döngü
     while True:
         try:
-            # Fiyatları çek
-            prices = await fetch_multiple_prices(
-                symbols,
+            # --- Yalnızca Playwright ile fiyatları çek ---
+            prices = await fetch_multiple_prices_playwright(
+                symbols=symbols,
                 retries=retries,
-                delay_between_requests=1,       # kısa ara (isteğe bağlı)
-                notify_failures=notify_failures,
-                bots=bots,
-                bot_name=bot_name,
-                chromedriver_path=chromedriver_path,
-                timeout_sec=timeout_sec,
+                timeout_ms=timeout_sec * 1000,
                 concurrency=concurrency,
             )
 
@@ -1140,7 +1025,7 @@ async def main_trading(
                 await save_live_data(cursor, conn, symbol, price, changes, now)
                 await save_closing_price(cursor, conn, symbol, price, now)
 
-            # Döngü beklemesi: JSON'dan
+            # JSON'dan gelen aralıkla bekle
             await asyncio.sleep(fetch_every_sec)
 
         except Exception as e:
@@ -1151,7 +1036,6 @@ async def main_trading(
                 except Exception:
                     logging.warning("Telegram bildirimi gönderilemedi (loop error).")
 
-
 # Ana giriş noktası
 if __name__ == "__main__":
     bots = {}     # Telegram config okunamazsa bile servis çalışsın
@@ -1159,16 +1043,16 @@ if __name__ == "__main__":
     cursor = None
 
     try:
-        # 6.1) Global konfigürasyonu oku (tek kaynak)
+        # 1) Global konfigürasyonu oku (tek kaynak)
         with open(GLOBAL_CFG, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            fetch_cfg = cfg.get("fetch", {})
-            pool_cfg  = cfg.get("selenium_pool", {})
-        # 6.2) Log seviyesi (basicConfig sonrası level güncellenebilir)
+            fetch_cfg = cfg.get("fetch", {})  # Playwright parametreleri
+
+        # 2) Log seviyesi (basicConfig sonrası level güncellenebilir)
         level_name = (cfg.get("logging_level") or "INFO").upper()
         logging.getLogger().setLevel(getattr(logging, level_name, logging.INFO))
 
-        # 6.3) Paths override (ENV > JSON > defaults mantığı: ENV zaten en başta uygulandı)
+        # 3) Paths override (ENV > JSON > defaults)
         paths = cfg.get("paths") or {}
         db_override  = paths.get("db_path")
         log_override = paths.get("log_dir")
@@ -1187,7 +1071,7 @@ if __name__ == "__main__":
             TELEGRAM_CFG = telegram_cfg_override
             logging.info(f"TELEGRAM_CFG override edildi: {TELEGRAM_CFG}")
 
-        # 6.4) Telegram yapılandırmasını yükle (opsiyonel)
+        # 4) Telegram yapılandırmasını yükle (opsiyonel)
         try:
             bots = load_telegram_config(TELEGRAM_CFG)
         except FileNotFoundError:
@@ -1200,7 +1084,7 @@ if __name__ == "__main__":
             logging.exception("Telegram config yüklenemedi, Telegram devre dışı")
             bots = {}
 
-        # 6.5) Veritabanı bağlantısı + tablolar
+        # 5) Veritabanı bağlantısı + tablolar
         conn, cursor = connect_db()
         if not conn or not cursor:
             raise ConnectionError("Failed to connect to the database.")
@@ -1208,7 +1092,7 @@ if __name__ == "__main__":
         create_global_tables(cursor)
         conn.commit()
 
-        # 6.6) Semboller (symbols veya global_symbols anahtarını destekle)
+        # 6) Semboller (symbols veya global_symbols anahtarını destekle)
         global_symbols = cfg.get("symbols") or cfg.get("global_symbols") or []
         if not global_symbols:
             raise ValueError(
@@ -1217,12 +1101,12 @@ if __name__ == "__main__":
             )
         logging.info(f"Loaded global symbols: {global_symbols}")
 
-        # 6.7) Price limits (JSON varsa sabiti güncelle)
+        # 7) Price limits (JSON varsa sabiti güncelle)
         if "price_limits" in cfg and isinstance(cfg["price_limits"], dict):
             LIMITS.clear()
             LIMITS.update(cfg["price_limits"])
 
-        # 6.8) Retention: hem doğru tablo adlarını hem olası kısa adları destekle
+        # 8) Retention: doğru tablo adları + kısa ad desteği
         # JSON önerilen: {"global_live_data":5000,"global_closing_data":8000}
         # Eski alışkanlık için destek: {"global_live":5000,"global_closing":8000}
         if "retention" in cfg and isinstance(cfg["retention"], dict):
@@ -1242,8 +1126,8 @@ if __name__ == "__main__":
                 else:
                     logging.warning(f"Bilinmeyen retention anahtarı: {key}")
 
-        # 6.9) Ana işlem döngüsü
-        asyncio.run(main_trading(global_symbols, bots, conn, cursor, fetch_cfg, pool_cfg))
+        # 9) Ana işlem döngüsü (yalnızca Playwright toplayıcı)
+        asyncio.run(main_trading(global_symbols, bots, conn, cursor, fetch_cfg))
 
     except FileNotFoundError as e:
         logging.error(f"File not found: {e}", exc_info=True)
