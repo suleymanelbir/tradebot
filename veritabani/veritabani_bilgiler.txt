@@ -1,0 +1,22 @@
+veritabanı dizini: /opt/tradebot/veritabani/global_data.db
+veritabanı path: /opt/tradebot/veritabani/global_data.db
+.tables
+global_closing_data  global_live_data  
+----------------------------
+
+PRAGMA table_info(global_live_data);
+0|id|INTEGER|0||1
+1|timestamp|DATETIME|0||0
+2|symbol|TEXT|0||0
+3|live_price|FLOAT|0||0
+4|change_15M|FLOAT|0||0
+5|change_1H|FLOAT|0||0
+6|change_4H|FLOAT|0||0
+7|change_1D|FLOAT|0||0
+
+--------------------------------
+SELECT DISTINCT symbol FROM global_live_data;
+CRYPTOCAP:USDT.D
+CRYPTOCAP:BTC.D
+CRYPTOCAP:TOTAL3
+-----------------------------------
