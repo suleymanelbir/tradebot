@@ -20,6 +20,9 @@ Logları izle: sudo journalctl -u tradebot-global.service -f
 #                                                                                                                           *
 # ***************************************************************************************************************************
 # 🔧 Sistem ve dosya işlemleri
+# ─────────────────────────────────────────────
+# 📦 Standart Kütüphaneler
+# ─────────────────────────────────────────────
 import os
 import json
 import sqlite3
@@ -29,53 +32,51 @@ import time
 import tempfile
 import shutil
 import random
+import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-# 🧠 Tip belirtimleri
-from typing import List, Dict, Optional, Any
+# ─────────────────────────────────────────────
+# 🧠 Tip Belirtimleri
+# ─────────────────────────────────────────────
+from typing import Any, Dict, List, Optional, Literal
 
-# 🌐 HTTP istekleri
+# ─────────────────────────────────────────────
+# 📝 Loglama Araçları
+# ─────────────────────────────────────────────
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+# ─────────────────────────────────────────────
+# 🌐 HTTP İstekleri
+# ─────────────────────────────────────────────
 import requests
 
-
-
+# ─────────────────────────────────────────────
 # 🎭 Playwright (aktif kullanım için açık bırakıldı)
+# ─────────────────────────────────────────────
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 print("✅ Script başladı")
-
-# ─────────────────────────────────────────────────────────────
-# 1) Merkezî yol sabitleri (ENV ile override edilebilir)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 📁 Merkezî Yol Sabitleri (ENV ile override edilebilir)
+# ─────────────────────────────────────────────
 CONFIG_DIR = os.getenv("TRADEBOT_CONFIG_DIR", "/opt/tradebot/globalislemler/config")
 DB_PATH    = os.getenv("TRADEBOT_DB_PATH",    "/opt/tradebot/veritabani/global_data.db")
-LOG_DIR    = os.getenv("TRADEBOT_LOG_DIR",    "/opt/tradebot/log")  # JSON'da da /opt/tradebot/log
+LOG_DIR    = os.getenv("TRADEBOT_LOG_DIR",    "/opt/tradebot/log")
 
-# Dizinleri garantiye al
+# 📂 Dizinleri garantiye al
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 Path(Path(DB_PATH).parent).mkdir(parents=True, exist_ok=True)
 
-# Config dosya isimleri (varsayılan)
+# 📄 Config dosyaları (varsayılan)
 GLOBAL_CFG   = os.path.join(CONFIG_DIR, "global_data_config.json")
 TELEGRAM_CFG = os.path.join(CONFIG_DIR, "telegram_bots.json")
 SYMBOLS_CFG  = os.path.join(CONFIG_DIR, "symbols.json")
 
-# ─────────────────────────────────────────────────────────────
-# 2) Logging (klasör hazırlandıktan sonra!)
-# ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "database_manager_5.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logging.info("Database manager başlatıldı.")
-logging.info("RUNNING_FROM_FILE=%s", __file__)
-
-# ─────────────────────────────────────────────────────────────
-# 3) Tablolar, veritabanı, limitler
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 🗃️ Veritabanı ve Tablo Sabitleri
+# ─────────────────────────────────────────────
 DB_NAME = DB_PATH  # sqlite için tam yol
 
 GLOBAL_LIVE_TABLE    = "global_live_data"
@@ -83,21 +84,108 @@ GLOBAL_CLOSING_TABLE = "global_closing_data"
 
 RECORD_LIMITS = {
     GLOBAL_LIVE_TABLE: 1500,
-    GLOBAL_CLOSING_TABLE: 5000
+    GLOBAL_CLOSING_TABLE: 5000,
+    "global_close_15m": 100000,
+    "global_close_1h":  50000,
+    "global_close_4h":  30000,
 }
 
+# ─────────────────────────────────────────────
+# 📊 Sembol Limitleri (JSON ile override edilebilir)
+# ─────────────────────────────────────────────
 LIMITS = {
     "CRYPTOCAP:USDT.D": {"lower": 3.0, "upper": 7.0},
     "CRYPTOCAP:BTC.D":  {"lower": 40.0, "upper": 70.0}
 }
 
-# Aynı kapanışı tekrarlamamak için toleranslar
+# ─────────────────────────────────────────────
+# 📅 Kapanış Tablosu Şeması
+# ─────────────────────────────────────────────
+DAILY_TABLE_NAME     = "global_closing_data"
+DAILY_PRICE_COL      = "price"
+DAILY_TS_COL         = "timestamp"
+DAILY_INTERVAL_COL   = "interval"
+DAILY_INTERVAL_VALUE = "1D"
+
+# 🔁 Kapanış Tekrarını Önleme Toleransları
 INTERVAL_DUPLICATE_CHECK = {
-    "15m": timedelta(minutes=12),                      # 12 dk
-    "1h":  timedelta(minutes=53, seconds=30),          # 53 dk 30 sn
-    "4h":  timedelta(hours=3, minutes=50, seconds=15), # 3 sa 50 dk 15 sn
-    "1d":  timedelta(hours=23, minutes=50, seconds=45) # 23 sa 50 dk 45 sn
+    "15m": timedelta(minutes=12),
+    "1h":  timedelta(minutes=53, seconds=30),
+    "4h":  timedelta(hours=3, minutes=50, seconds=15),
+    "1d":  timedelta(hours=23, minutes=50, seconds=45)
 }
+
+# ─────────────────────────────────────────────
+# 📡 Canlı Veri Tablosu Şeması
+# ─────────────────────────────────────────────
+LIVE_TABLE_NAME = "global_live_data"
+LIVE_PRICE_COL  = "live_price"
+LIVE_TS_COL     = "timestamp"
+
+TIMEFRAME_SECONDS = {
+    "15m": 15 * 60,
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+
+# ─────────────────────────────────────────────
+# 💓 Heartbeat Sayaçları ve Durum İzleyiciler
+# ─────────────────────────────────────────────
+PROCESS_START_TS: float = time.time()
+FETCH_SUCCESS_COUNT: int = 0
+FETCH_ERROR_COUNT: int = 0
+
+LAST_HEARTBEAT_TS: Optional[int] = None
+LAST_LIVE_INSERT_TS: Optional[int] = None
+LAST_LOOP_TS: Optional[int] = None
+
+SYMBOL_LAST_OK_TS: Dict[str, int] = {}  # sembol bazında son başarılı insert epoch
+
+# 🔔 Uyarı Cooldown Mekanizması
+LAST_ALERT_TS: Dict[str, int] = {"global_stale": 0}
+SYMBOL_ALERT_TS: Dict[str, int] = {}
+ALERT_COOLDOWN_SEC = 900  # 15 dk
+
+# 🧠 JSON'dan yüklenecek sağlık konfigürasyonu
+HEALTH_CFG: Dict[str, Any] = {}
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "source": record.name,
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno
+        }
+        return json.dumps(log_record)
+    
+def setup_logging(log_path: str, max_bytes=2_000_000, backup_count=3):
+    logger = logging.getLogger("tradebot_logger")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    # Genel log dosyası
+    main_handler = RotatingFileHandler(log_path, maxBytes=max_bytes, backupCount=backup_count)
+    main_handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    logger.addHandler(main_handler)
+
+    # 🔔 Hatalar için ayrı alerts.log dosyası
+    alerts_path = os.path.join(os.path.dirname(log_path), "alerts.log")
+    alerts_handler = RotatingFileHandler(alerts_path, maxBytes=1_000_000, backupCount=2)
+    alerts_handler.setLevel(logging.ERROR)  # Sadece ERROR ve üstü
+    alerts_handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    logger.addHandler(alerts_handler)
+
+    logger.info("Log sistemi JSON formatında başlatıldı.")
+    logger.info("RUNNING_FROM_FILE=%s", __file__)
+    return logger
+
+
+
 
 # ─────────────────────────────────────────────────────────────
 # 4) Yardımcı: Telegram konfig yükleyici (iki şemayı da destekler)
@@ -159,6 +247,171 @@ def load_telegram_config(config_path: str) -> dict:
 
     logging.info("Telegram configuration loaded successfully.")
     return bots
+
+def to_sqlite_dt(dt: datetime) -> str:
+    """UTC datetime → 'YYYY-MM-DD HH:MM:SS' (SQLite ile sıralanabilir)"""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def bucket_start(ts_dt: datetime, tf: str) -> int:
+    """UTC datetime'i tf periyodunun başlangıç epoch’una indirger."""
+    s = TIMEFRAME_SECONDS[tf]
+    ts = int(ts_dt.replace(tzinfo=timezone.utc).timestamp())
+    return (ts // s) * s
+
+def last_completed_bucket_start(now_dt: datetime, tf: str) -> int:
+    """Şu an için bitmiş son periyodun başlangıç epoch’u."""
+    s = TIMEFRAME_SECONDS[tf]
+    cur_bucket = bucket_start(now_dt, tf)
+    return cur_bucket - s
+
+
+# ─────────────────────────────────────────────────────────────
+# Hearbeat için kullanılan foonkisyonlar
+# ─────────────────────────────────────────────────────────────
+def _max_int(cursor, sql: str, params: tuple = ()) -> Optional[int]:
+    try:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception as e:
+        logging.debug(f"_max_int failed: {e}")
+        return None
+
+def _count_int(cursor, sql: str, params: tuple = ()) -> Optional[int]:
+    try:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception as e:
+        logging.debug(f"_count_int failed: {e}")
+        return None
+
+def _fmt_age(sec: Optional[int]) -> str:
+    if not sec or sec < 0:
+        return "?"
+    if sec < 90:
+        return f"{sec}s"
+    m = sec // 60
+    if m < 90:
+        return f"{m}m"
+    h = m // 60
+    if h < 36:
+        return f"{h}h"
+    d = h // 24
+    return f"{d}d"
+
+def collect_health_snapshot(conn, cursor, symbols: list[str]) -> Dict[str, Any]:
+    """
+    DB ve sayaçlardan hafif bir sağlık özeti üretir.
+    Ağır sorgu yok; MAX/COUNT gibi hızlı toplamlardır.
+    """
+    now_epoch = int(time.time())
+    snapshot: Dict[str, Any] = {
+        "now_epoch": now_epoch,
+        "uptime_sec": now_epoch - int(PROCESS_START_TS),
+        "symbols_count": len(symbols),
+        "fetch_success": FETCH_SUCCESS_COUNT,
+        "fetch_error": FETCH_ERROR_COUNT,
+        "last_live_insert_ts": LAST_LIVE_INSERT_TS,
+        "per_symbol_last_ok_ts": dict(SYMBOL_LAST_OK_TS),
+        "db": {"live": {}, "close": {}},
+    }
+
+    # global_live_data
+    last_live = _max_int(cursor,
+        "SELECT MAX(COALESCE(ts_utc, CAST(strftime('%s', timestamp) AS INTEGER))) FROM global_live_data")
+    live_rows = _count_int(cursor, "SELECT COUNT(*) FROM global_live_data")
+    snapshot["db"]["live"] = {
+        "last_ts": last_live,
+        "last_age_sec": (now_epoch - last_live) if last_live else None,
+        "rows": live_rows,
+    }
+
+    # periyot kapanış kovaları (varsa)
+    for tbl, key in (("global_close_15m", "15m"),
+                     ("global_close_1h",  "1h"),
+                     ("global_close_4h",  "4h")):
+        last_bucket = None
+        rows = None
+        try:
+            last_bucket = _max_int(cursor, f"SELECT MAX(ts_bucket_utc) FROM {tbl}")
+            rows = _count_int(cursor, f"SELECT COUNT(*) FROM {tbl}")
+        except Exception:
+            pass
+        snapshot["db"]["close"][key] = {
+            "last_bucket": last_bucket,
+            "last_age_sec": (now_epoch - last_bucket) if last_bucket else None,
+            "rows": rows,
+        }
+
+    # 1D kapanışlar (global_closing_data)
+    last_1d = _max_int(cursor, """
+        SELECT MAX(CAST(strftime('%s', timestamp) AS INTEGER))
+        FROM global_closing_data
+        WHERE UPPER(interval)='1D'
+    """)
+    rows_1d = _count_int(cursor, "SELECT COUNT(*) FROM global_closing_data WHERE UPPER(interval)='1D'")
+    snapshot["db"]["close"]["1d"] = {
+        "last_ts": last_1d,
+        "last_age_sec": (now_epoch - last_1d) if last_1d else None,
+        "rows": rows_1d,
+    }
+
+    # DB dosya boyutu (opsiyonel)
+    try:
+        db_path = DB_NAME  # zaten global
+        if db_path and os.path.exists(db_path):
+            snapshot["db"]["file_size_bytes"] = os.path.getsize(db_path)
+    except Exception:
+        pass
+
+    return snapshot
+
+def format_heartbeat_text(s: Dict[str, Any]) -> str:
+    up = _fmt_age(s.get("uptime_sec"))
+    live = s["db"]["live"]
+    live_age = _fmt_age(live.get("last_age_sec"))
+    rows = live.get("rows")
+
+    c15 = s["db"]["close"].get("15m", {})
+    c1h = s["db"]["close"].get("1h", {})
+    c4h = s["db"]["close"].get("4h", {})
+    c1d = s["db"]["close"].get("1d", {})
+
+    parts = [
+        "✅ <b>Heartbeat</b> (yaşıyorum)",
+        f"⏱️ Uptime: <b>{up}</b>",
+        f"📈 Sembol sayısı: <b>{s.get('symbols_count')}</b>",
+        f"🧩 Fetch: ok={s.get('fetch_success')} err={s.get('fetch_error')}",
+        f"💾 Canlı yazım: <b>{live_age}</b> önce (rows={rows})",
+        f"🕒 Kova 15m: {_fmt_age(c15.get('last_age_sec'))}",
+        f"🕒 Kova 1h:  {_fmt_age(c1h.get('last_age_sec'))}",
+        f"🕒 Kova 4h:  {_fmt_age(c4h.get('last_age_sec'))}",
+        f"📅 1D close: {_fmt_age(c1d.get('last_age_sec'))}",
+    ]
+    return "\n".join(parts)
+
+def post_n8n_if_configured(payload: Dict[str, Any], health_cfg: Dict[str, Any]) -> None:
+    """
+    n8n Webhook URL'i ENV veya JSON'dan alınır. Boşsa gönderim yapılmaz.
+    """
+    url = os.environ.get("N8N_WEBHOOK_URL") or (health_cfg.get("n8n_webhook_url") or "")
+    if not url:
+        return
+    headers = {"Content-Type": "application/json"}
+    auth_hdr = os.environ.get("N8N_AUTH_HEADER") or health_cfg.get("n8n_auth_header")
+    if auth_hdr:
+        headers["Authorization"] = auth_hdr
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=5)
+        resp.raise_for_status()
+        logging.info("Heartbeat snapshot n8n'a gönderildi.")
+    except Exception as e:
+        logging.warning(f"n8n gönderimi başarısız: {e}")
+
+
+
 # ─────────────────────────────────────────────────────────────
 # playwright için kullanılan fonksiyon
 # ─────────────────────────────────────────────────────────────
@@ -386,6 +639,45 @@ def create_global_tables(cursor):
         )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS global_close_15m (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        ts_bucket_utc INTEGER NOT NULL,
+        close_price REAL NOT NULL,
+        updated_at_utc INTEGER NOT NULL,
+        UNIQUE(symbol, ts_bucket_utc)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc15_symbol ON global_close_15m(symbol)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc15_bucket ON global_close_15m(ts_bucket_utc)")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS global_close_1h (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        ts_bucket_utc INTEGER NOT NULL,
+        close_price REAL NOT NULL,
+        updated_at_utc INTEGER NOT NULL,
+        UNIQUE(symbol, ts_bucket_utc)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc1h_symbol ON global_close_1h(symbol)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc1h_bucket ON global_close_1h(ts_bucket_utc)")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS global_close_4h (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        ts_bucket_utc INTEGER NOT NULL,
+        close_price REAL NOT NULL,
+        updated_at_utc INTEGER NOT NULL,
+        UNIQUE(symbol, ts_bucket_utc)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc4h_symbol ON global_close_4h(symbol)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_gc4h_bucket ON global_close_4h(ts_bucket_utc)")
+
 async def clean_old_data_task(cursor, conn):
     """
     Eski verileri düzenli olarak temizler.
@@ -410,6 +702,127 @@ async def clean_old_data_task(cursor, conn):
 
 
         await asyncio.sleep(3600)  # Her saat başı temizlik yap
+
+def save_period_close(cursor, conn, symbol: str, price: float, now_dt: datetime, tf: str) -> None:
+    """
+    Verilen periyot için (15m/1h/4h) o anki bucket’a close fiyatını UPSERT eder.
+    Periyot bitimine kadar her döngüde güncellenir; periyot bittiğinde son yazılan değer kapanıştır.
+    """
+    assert tf in ("15m", "1h", "4h")
+    table = {"15m": "global_close_15m", "1h": "global_close_1h", "4h": "global_close_4h"}[tf]
+    bstart = bucket_start(now_dt, tf)
+    now_epoch = int(now_dt.replace(tzinfo=timezone.utc).timestamp())
+
+    cursor.execute(f"""
+        INSERT INTO {table} (symbol, ts_bucket_utc, close_price, updated_at_utc)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(symbol, ts_bucket_utc)
+        DO UPDATE SET close_price=excluded.close_price, updated_at_utc=excluded.updated_at_utc
+    """, (symbol, bstart, price, now_epoch))
+    conn.commit()
+
+def get_reference_close(
+    cursor,
+    symbol: str,
+    tf: Literal["15m", "1h", "4h", "1d"],
+    now_dt: datetime
+) -> Optional[float]:
+    """
+    Yüzde hesabında kullanılacak referans kapanışını döndürür.
+    - 15m/1h/4h: bitmiş son kovayı hedefler; yoksa en yakın önceki kovayı alır.
+    - 1d: global_closing_data’dan son *tam gün* kapanışını (bugün hariç) alır.
+
+    Dönüş: float (kapanış fiyatı) veya None
+    """
+    # Sembolü güvenle temizle
+    try:
+        sym = clean_symbol(symbol) if "clean_symbol" in globals() else symbol
+    except Exception:
+        sym = symbol
+
+    try:
+        if tf in ("15m", "1h", "4h"):
+            table = {
+                "15m": "global_close_15m",
+                "1h":  "global_close_1h",
+                "4h":  "global_close_4h",
+            }[tf]
+
+            # Bitmiş son kovanın başlangıcı (UTC)
+            target_bucket = last_completed_bucket_start(now_dt, tf)
+
+            # 1) Tam hedef kova varsa onu al
+            cursor.execute(
+                f"SELECT close_price FROM {table} WHERE symbol=? AND ts_bucket_utc=? LIMIT 1",
+                (sym, int(target_bucket)),
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                try:
+                    val = float(row[0])
+                    return val if val > 0 else None
+                except Exception:
+                    pass  # parsing hatası durumunda aşağıdaki fallback'e düş
+
+            # 2) En yakın önceki kova
+            cursor.execute(
+                f"""
+                SELECT close_price
+                FROM {table}
+                WHERE symbol=? AND ts_bucket_utc < ?
+                ORDER BY ts_bucket_utc DESC
+                LIMIT 1
+                """,
+                (sym, int(target_bucket)),
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                try:
+                    val = float(row[0])
+                    return val if val > 0 else None
+                except Exception:
+                    return None
+
+            return None
+
+        elif tf == "1d":
+            # Bugünün UTC 00:00 sınırı (bugün hariç en yakın günlük kapanışı alacağız)
+            midnight_today_epoch = bucket_start(now_dt, "1d")  # epoch (int)
+            boundary = to_sqlite_dt(datetime.fromtimestamp(midnight_today_epoch, tz=timezone.utc))
+
+            # 1D kapanışlar 'global_closing_data' tablosunda: (timestamp, symbol, price, interval)
+            # interval için hem '1D' hem '1d' kayıtları varsa ikisini de kapsayalım
+            cursor.execute(
+                f"""
+                SELECT {DAILY_PRICE_COL}
+                FROM {DAILY_TABLE_NAME}
+                WHERE symbol = ?
+                AND {DAILY_INTERVAL_COL} IN ('1D', '1d')
+                AND {DAILY_TS_COL} < ?
+                ORDER BY {DAILY_TS_COL} DESC
+                LIMIT 1
+                """,
+                (sym, boundary),
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                try:
+                    val = float(row[0])
+                    return val if val > 0 else None
+                except Exception:
+                    return None
+
+            return None
+
+
+        else:
+            logging.warning(f"[{sym}] get_reference_close: bilinmeyen timeframe: {tf}")
+            return None
+
+    except Exception as e:
+        logging.warning(f"[{sym}] get_reference_close error for {tf}: {e}", exc_info=False)
+        return None
+
 
 def is_duplicate_closing(cursor, symbol, db_interval, closing_time):
     """
@@ -570,64 +983,96 @@ def check_price_limits(symbol, price, bots):
 def clean_symbol(symbol): 
     return symbol.strip().replace(' ', '')
 
-async def save_closing_price(cursor, conn, symbol, live_price, now=None):
+async def save_closing_price(
+    cursor,
+    conn,
+    symbol: str,
+    live_price: float,
+    now: datetime | None = None
+) -> None:
     """
-    Belirtilen sembol ve zaman dilimi için kapanış fiyatını kaydeder veya günceller.
+    15m/1h/4h kapanışlarını periyot tablolarına (global_close_15m/_1h/_4h),
+    1D kapanışını ise global_closing_data tablosuna yazar.
 
-    Args:
-        cursor: Veritabanı cursor nesnesi.
-        conn: Veritabanı bağlantı nesnesi.
-        symbol (str): İşlem sembolü (ör. "BTCUSDT").
-        live_price (float): Kaydedilecek mevcut fiyat.
-        now (datetime, optional): Şu anki zaman. Varsayılan UTC şimdiki zaman.
-
-    Raises:
-        RuntimeError: Kaydetme sırasında hata oluşursa.
+    - Kova etiketleri: last_completed_bucket_start(now, tf) (UTC epoch, bitmiş kova)
+    - Günlük etiket:   last_completed_bucket_start(now, "1d") → UTC midnight (TEXT)
+    - UPSERT kullanır (UNIQUE kısıtlarına göre günceller).
     """
     if now is None:
         now = datetime.now(timezone.utc)
 
-    symbol = clean_symbol(symbol)
-
-    intervals = {
-        "15M": timedelta(minutes=15),
-        "1H": timedelta(hours=1),
-        "4H": timedelta(hours=4),
-        "1D": timedelta(days=1)
-    }
+    try:
+        sym = clean_symbol(symbol)
+    except Exception:
+        sym = symbol
 
     try:
-        for interval, duration in intervals.items():
-            normalized_interval = interval.upper()
+        # -------------------------
+        # 1) 15m / 1h / 4h kapanışları
+        # -------------------------
+        tf_table_map = {
+            "15m": "global_close_15m",
+            "1h":  "global_close_1h",
+            "4h":  "global_close_4h",
+        }
 
-            # Zaman dilimi için kapanış zamanını hesapla
-            closing_time = get_closing_time(normalized_interval, now)
+        for tf, table in tf_table_map.items():
+            try:
+                bucket_start_epoch = last_completed_bucket_start(now, tf)  # int (UTC epoch)
+                now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())  # ya da int(datetime.now(timezone.utc).timestamp())
 
-            # Eğer kapanış zamanı henüz gelmemişse, atla
-            if now < closing_time:
-                logging.info(f"{symbol} için {normalized_interval} kapanış zamanı ({closing_time}) henüz gelmedi. Atlanıyor.")
-                continue
+                cursor.execute(
+                    f"""
+                    INSERT INTO {table} (symbol, ts_bucket_utc, close_price, updated_at_utc)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(symbol, ts_bucket_utc) DO UPDATE SET
+                        close_price     = excluded.close_price,
+                        updated_at_utc  = excluded.updated_at_utc
+                    """,
+                    (sym, int(bucket_start_epoch), float(live_price), now_epoch),
+                )
+            except sqlite3.OperationalError as oe:
+                # Tablo yoksa ya da şema uyumsuzsa anlaşılır log üret
+                logging.error(f"[{sym}] save_closing_price: {table} yazımı sırasında OperationalError: {oe}")
+                # İstersen burada tablo oluşturmayı tetikleyebilirsin (create_global_tables)
+                # raise  # İstersen yükselt
 
-            # UNIQUE kuralını işlemek için INSERT OR REPLACE kullan
-            cursor.execute(f"""
-                INSERT INTO global_closing_data (timestamp, symbol, price, interval)
+        # -------------------------
+        # 2) Günlük (1D) kapanışı
+        # -------------------------
+        try:
+            day_bucket_epoch = last_completed_bucket_start(now, "1d")
+            day_bucket_dt    = datetime.fromtimestamp(day_bucket_epoch, tz=timezone.utc)
+            day_ts_text      = to_sqlite_dt(day_bucket_dt)  # 'YYYY-MM-DD HH:MM:SS' (UTC)
+
+            cursor.execute(
+                f"""
+                INSERT INTO {DAILY_TABLE_NAME}
+                    ({DAILY_TS_COL}, symbol, {DAILY_PRICE_COL}, {DAILY_INTERVAL_COL})
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(symbol, timestamp, interval)
-                DO UPDATE SET price = excluded.price
-            """, (closing_time, symbol, live_price, normalized_interval))
+                ON CONFLICT(symbol, {DAILY_TS_COL}, {DAILY_INTERVAL_COL}) DO UPDATE SET
+                    {DAILY_PRICE_COL} = excluded.{DAILY_PRICE_COL}
+                """,
+                (day_ts_text, sym, float(live_price), DAILY_INTERVAL_VALUE),
+            )
+        except sqlite3.OperationalError as oe:
+            logging.error(f"[{sym}] save_closing_price: {DAILY_TABLE_NAME} yazımı sırasında OperationalError: {oe}")
+            # raise  # İstersen yükselt
 
-            conn.commit()
-            if symbol == "CRYPTOCAP:USDT.D":
-                logging.info(f"Closing price kaydedildi veya güncellendi: {symbol}, Interval: {normalized_interval}, Price: {live_price}")
+        # Tek commit
+        conn.commit()
+
+        # İsteğe bağlı, sembol bazlı bilgi logları
+        # if sym == "CRYPTOCAP:USDT.D":
+        #     logging.info(f"[{sym}] close upsert OK | 15m/1h/4h + 1D")
 
     except sqlite3.Error as e:
         conn.rollback()
-        logging.error(f"Database error while saving closing price for {symbol}: {e}")
+        logging.error(f"[{sym}] save_closing_price: Database error: {e}", exc_info=True)
 
     except Exception as e:
         conn.rollback()
-        logging.error(f"Unexpected error while saving closing price for {symbol}: {e}")
-
+        logging.error(f"[{sym}] save_closing_price: Unexpected error: {e}", exc_info=True)
 
 
 
@@ -636,148 +1081,253 @@ async def save_closing_price(cursor, conn, symbol, live_price, now=None):
 
 async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
     """
-    Save live price and percentage changes for a given symbol.
-
-    Args:
-        cursor: Database cursor for executing SQL commands.
-        conn: Database connection object for committing changes.
-        symbol (str): Trading symbol (e.g., "BTCUSD").
-        live_price (float): The current live price of the symbol.
-        changes (dict): A dictionary containing percentage changes (e.g., {"15M": -0.5, "1H": 0.1}).
-        now (datetime, optional): Timestamp for the data. Defaults to current UTC time.
-
-    Raises:
-        RuntimeError: If there is an issue with database saving.
+    Canlı fiyatı ve yüzde değişimlerini veritabanına yazar.
+    Notlar:
+      - Fonksiyon yapısı korunmuştur (imza ve akış).
+      - CRYPTOCAP:USDT.D için emniyet bandı kontrolü (3–8) sürer.
+      - Kayıt başarılı olursa heartbeat sayaçları güncellenir:
+          LAST_LIVE_INSERT_TS ve SYMBOL_LAST_OK_TS[symbol]
+      - Telegram gönderimleri güvenli-opsiyonel (bots global değişkeninden okunur).
     """
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # Normalize symbol
-    symbol = clean_symbol(symbol)
+    # Sembol normalize
+    try:
+        clean_sym = clean_symbol(symbol)
+    except Exception:
+        clean_sym = symbol
 
-    # Alt ve üst limit kontrolü yalnızca CRYPTOCAP:USDT.D için uygulanır
-    if symbol == "CRYPTOCAP:USDT.D":
+    # Yalnızca CRYPTOCAP:USDT.D için alt/üst limit kontrolü
+    if clean_sym == "CRYPTOCAP:USDT.D":
         MIN_PRICE_LIMIT = 3.0
         MAX_PRICE_LIMIT = 8.0
         if live_price < MIN_PRICE_LIMIT or live_price > MAX_PRICE_LIMIT:
-            logging.error(f"Live price for {symbol} is out of bounds: {live_price}. Must be between {MIN_PRICE_LIMIT} and {MAX_PRICE_LIMIT}.")
-            send_telegram_message(f"⚠️ Live price for {symbol} out of bounds: {live_price}. Ignored.")
+            logging.error(
+                f"Live price for {clean_sym} is out of bounds: {live_price}. "
+                f"Must be between {MIN_PRICE_LIMIT} and {MAX_PRICE_LIMIT}."
+            )
+            try:
+                _bots = globals().get("bots", {})
+                send_telegram_message(
+                    f"⚠️ Live price for {clean_sym} out of bounds: {live_price}. Ignored.",
+                    "alerts_bot",
+                    _bots,
+                )
+            except Exception:
+                pass
             return  # Limit dışındaki fiyatlar için kayıt yapmıyoruz
 
-    # Son fiyatı kontrol et (fiyat değişmiş mi?)
-    query_last_price = """
-        SELECT live_price
-        FROM global_live_data
-        WHERE symbol = ?
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """
-    cursor.execute(query_last_price, (symbol,))
-    last_price_record = cursor.fetchone()
+    # Son fiyatı kontrol et (değişmemişse yazma)
+    try:
+        cursor.execute(
+            """
+            SELECT live_price
+            FROM global_live_data
+            WHERE symbol = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (clean_sym,),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            last_price = float(row[0])
+            if live_price == last_price:
+                logging.info(f"No change in live price for {clean_sym}. Skipping save.")
+                return
+    except Exception as e:
+        # Son fiyat okuma başarısız olsa bile yazımı denemeye devam ederiz
+        logging.debug(f"Last-price lookup failed for {clean_sym}: {e}")
 
-    if last_price_record:
-        last_price = float(last_price_record[0])
-        if live_price == last_price:
-            logging.info(f"No change in live price for {symbol}. Skipping save.")
-            return  # Fiyat değişmemişse kayıt yapmıyoruz
+    # changes sözlüğündeki olası iki anahtar şemasını da destekle
+    ch_15m = changes.get("15M")
+    if ch_15m is None:
+        ch_15m = changes.get("ch_15m")
 
-    # Prepare SQL query and parameters
-    query = """
-        INSERT INTO global_live_data (timestamp, symbol, live_price, change_15M, change_1H, change_4H, change_1D)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ch_1h = changes.get("1H")
+    if ch_1h is None:
+        ch_1h = changes.get("ch_1h")
+
+    ch_4h = changes.get("4H")
+    if ch_4h is None:
+        ch_4h = changes.get("ch_4h")
+
+    ch_1d = changes.get("1D")
+    if ch_1d is None:
+        ch_1d = changes.get("ch_1d")
+
+    # INSERT
+    sql = """
+        INSERT INTO global_live_data (
+            timestamp, symbol, live_price, change_15M, change_1H, change_4H, change_1D
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
-    parameters = (
+    params = (
         now,
-        symbol,
-        live_price,
-        changes.get("15M", None),  # Use None if change value is missing
-        changes.get("1H", None),
-        changes.get("4H", None),
-        changes.get("1D", None),
+        clean_sym,
+        float(live_price),
+        None if ch_15m is None else float(ch_15m),
+        None if ch_1h  is None else float(ch_1h),
+        None if ch_4h  is None else float(ch_4h),
+        None if ch_1d  is None else float(ch_1d),
     )
 
     try:
-        # Execute the insertion query
-        cursor.execute(query, parameters)
+        cursor.execute(sql, params)
         conn.commit()
-        logging.info(f"Live data saved for {symbol}: Price: {live_price}, Changes: {changes}")
+        logging.info(f"Live data saved for {clean_sym}: Price={live_price}, Changes={changes}")
+
+        # --- Heartbeat sayaçlarını güncelle ---
+        try:
+            epoch_now = int(now.timestamp())
+            global LAST_LIVE_INSERT_TS, SYMBOL_LAST_OK_TS
+            LAST_LIVE_INSERT_TS = epoch_now
+            if isinstance(SYMBOL_LAST_OK_TS, dict):
+                SYMBOL_LAST_OK_TS[clean_sym] = epoch_now
+        except Exception as _e:
+            logging.debug(f"Heartbeat counters update skipped ({_e})")
+
+        # (Opsiyonel) Kalıcı sağlık kaydı: global_health varsa güncelle
+        try:
+            cursor.execute(
+                "UPDATE global_health SET last_global_live_utc=? WHERE id=1",
+                (int(now.timestamp()),),
+            )
+            conn.commit()
+        except Exception:
+            # tablo yoksa veya yetki yoksa sessiz geç
+            pass
 
     except sqlite3.IntegrityError as e:
-        # Handle database constraints (e.g., UNIQUE constraint violations)
         conn.rollback()
-        logging.warning(f"Integrity error while saving live data for {symbol}: {e}")
-        send_telegram_message(f"⚠️ Integrity error: Could not save data for {symbol}.", "alerts_bot", bots)
+        logging.warning(f"Integrity error while saving live data for {clean_sym}: {e}")
+        try:
+            _bots = globals().get("bots", {})
+            send_telegram_message(
+                f"⚠️ Integrity error: Could not save data for {clean_sym}.",
+                "alerts_bot",
+                _bots,
+            )
+        except Exception:
+            pass
 
     except sqlite3.OperationalError as e:
-        # Handle operational issues with the database
         conn.rollback()
-        logging.error(f"Operational error while saving live data for {symbol}: {e}")
-        send_telegram_message(f"⚠️ Database error: Could not save data for {symbol}.", "alerts_bot", bots)
+        logging.error(f"Operational error while saving live data for {clean_sym}: {e}")
+        try:
+            _bots = globals().get("bots", {})
+            send_telegram_message(
+                f"⚠️ Database error: Could not save data for {clean_sym}.",
+                "alerts_bot",
+                _bots,
+            )
+        except Exception:
+            pass
 
     except Exception as e:
-        # Handle other exceptions
         conn.rollback()
-        logging.error(f"Unexpected error saving live data for {symbol}: {e}")
-        send_telegram_message(f"❌ Unexpected error: Could not save data for {symbol}. Error: {str(e)}", "alerts_bot", bots)
+        logging.error(f"Unexpected error saving live data for {clean_sym}: {e}")
+        try:
+            _bots = globals().get("bots", {})
+            send_telegram_message(
+                f"❌ Unexpected error: Could not save data for {clean_sym}. Error: {str(e)}",
+                "alerts_bot",
+                _bots,
+            )
+        except Exception:
+            pass
 
     finally:
-        # Log the completion of the operation, even if it fails
-        logging.debug(f"Save live data operation completed for {symbol}.")
+        logging.debug(f"Save live data operation completed for {clean_sym}.")
 
 
-
-
-
-def calculate_changes(cursor, symbol, live_price):
+def calculate_changes(
+    cursor,
+    symbol: str,
+    live_price: float,
+    now_dt: Optional[datetime] = None
+) -> dict:
     """
-    Her zaman dilimi için yüzde değişimleri hesaplar.
-    
-    Args:
-        cursor: Veritabanı cursor nesnesi.
-        symbol (str): İşlem sembolü.
-        live_price (float): Canlı fiyat.
+    Yüzde değişimleri *kapanış referanslarına* göre hesaplar.
+    - 15m/1h/4h: global_close_15m/_1h/_4h tablosundaki bitmiş son kovayı baz alır.
+    - 1d: global_closing_data'daki son TAM gün kapanışını baz alır.
+    - Referans yoksa global_live_data'dan yaklaşık geçmiş snapshot ile fallback yapar.
 
-    Returns:
-        dict: Her zaman dilimi için yüzde değişimlerini içeren sözlük.
+    Dönüş:
+      Hem "15M/1H/4H/1D" anahtarları, hem de "ch_15m/ch_1h/ch_4h/ch_1d" anahtarları set edilir.
     """
-    symbol = clean_symbol(symbol)  # Sembolü temizle
-    intervals = ["15M", "1H", "4H", "1D"]
-    changes = {}
 
-    for interval in intervals:
+    # Temizlik ve zaman
+    try:
+        sym = clean_symbol(symbol) if "clean_symbol" in globals() else symbol
+    except Exception:
+        sym = symbol
+
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+
+    out: dict[str, Optional[float]] = {
+        "15M": None, "1H": None, "4H": None, "1D": None,
+        "ch_15m": None, "ch_1h": None, "ch_4h": None, "ch_1d": None,
+    }
+
+    # tf -> (display_key, ch_key)
+    tf_map = {
+        "15m": ("15M", "ch_15m"),
+        "1h":  ("1H",  "ch_1h"),
+        "4h":  ("4H",  "ch_4h"),
+        "1d":  ("1D",  "ch_1d"),
+    }
+
+    for tf, (disp_key, ch_key) in tf_map.items():
+        # 1) Ana referansı (kapanış tablolarından) almaya çalış
         try:
-            # Kapanış fiyatını sorgula
-            cursor.execute(f"""
-                SELECT price
-                FROM global_closing_data
-                WHERE symbol = ? AND interval = ?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (symbol, interval))
-
-            result = cursor.fetchone()
-            if result and result[0]:
-                closing_price = result[0]
-                # Kapanış fiyatı sıfır ise hatalı sonuçları önlemek için kontrol
-                if closing_price <= 0:
-                    logging.error(f"Invalid closing price for {symbol} at interval {interval}. Closing price: {closing_price}")
-                    changes[interval] = None
-                else:
-                    # Yüzde değişim hesapla
-                    changes[interval] = round(((live_price - closing_price) / closing_price) * 100, 2)
-                    logging.info(f"Change calculated for {symbol} at interval {interval}: {changes[interval]}%")
-            else:
-                # Kapanış fiyatı bulunamazsa uyarı logu
-                changes[interval] = None
-                logging.warning(f"No closing price found for {symbol} at interval {interval}. Using live price: {live_price}")
-
+            ref = get_reference_close(cursor, sym, tf, now_dt)  # 15m/1h/4h: global_close_XX, 1d: global_closing_data
         except Exception as e:
-            # Sorgulama sırasında hata oluşursa
-            logging.error(f"Error calculating change for {symbol}, Interval {interval}: {e}", exc_info=True)
-            changes[interval] = None
+            logging.warning(f"[{sym}] reference close lookup error for {tf}: {e}", exc_info=False)
+            ref = None
 
-    return changes
+        # 2) Referans yoksa fallback: global_live_data’dan ~tf önceki snapshot
+        if ref is None or (isinstance(ref, (int, float)) and ref <= 0):
+            try:
+                secs = TIMEFRAME_SECONDS[tf]
+                target_dt = now_dt - timedelta(seconds=secs)
+                target_ts_text = to_sqlite_dt(target_dt)  # 'YYYY-MM-DD HH:MM:SS' (UTC)
 
+                # NOT: Şemanıza göre sabitler dosyanın başında tanımlı olmalı:
+                # LIVE_TABLE_NAME = "global_live_data"
+                # LIVE_PRICE_COL  = "live_price"
+                # LIVE_TS_COL     = "timestamp"
+                cursor.execute(f"""
+                    SELECT {LIVE_PRICE_COL}
+                    FROM {LIVE_TABLE_NAME}
+                    WHERE symbol = ? AND {LIVE_TS_COL} <= ?
+                    ORDER BY {LIVE_TS_COL} DESC
+                    LIMIT 1
+                """, (sym, target_ts_text))
+                row = cursor.fetchone()
+                if row and row[0] and float(row[0]) > 0:
+                    ref = float(row[0])
+            except Exception as e:
+                logging.warning(f"[{sym}] fallback lookup error for {tf}: {e}", exc_info=False)
+                ref = None
+
+        # 3) Yüzdeyi hesapla
+        try:
+            if ref is not None and ref > 0:
+                ch = ((live_price - ref) / ref) * 100.0
+                out[disp_key] = round(ch, 2)
+                out[ch_key] = out[disp_key]
+            else:
+                out[disp_key] = None
+                out[ch_key] = None
+        except Exception as e:
+            logging.error(f"[{sym}] change calc error for {tf}: {e}", exc_info=False)
+            out[disp_key] = None
+            out[ch_key] = None
+
+    return out
 
 
 
@@ -962,24 +1512,29 @@ async def main_trading(
 ) -> None:
     """
     Semboller için fiyatları çeker, limitleri kontrol eder ve DB'ye yazar.
-    Yalnızca Playwright tabanlı toplayıcı kullanır.
+    Playwright tabanlı toplayıcı kullanır ve 15m/1h/4h/1D kapanışlarını kalıcı tablolara işler.
 
     Args:
         symbols: İzlenecek semboller listesi (örn. ["CRYPTOCAP:USDT.D", ...]).
         bots: Telegram bot yapılandırmaları (name -> {token, chat_id}).
         conn: SQLite bağlantı nesnesi.
         cursor: SQLite cursor nesnesi.
-        fetch_cfg: global_data_config.json içindeki "fetch" bölümü.
+        fetch_cfg: global_data_config.json içindeki "fetch" bölümü:
             - retries (int, varsayılan: 3)
-            - timeout_sec (int, varsayılan: 30)  # wait_seconds ile geri uyum
+            - timeout_sec (int, varsayılan: 30)  # wait_seconds ile geri uyumlu
             - fetch_every_sec (int, varsayılan: 60)
             - concurrency (int, varsayılan: 1)
     """
-    # JSON → çalışma parametreleri
+    # --- JSON → çalışma parametreleri ---
     retries         = int(fetch_cfg.get("retries", 3))
     timeout_sec     = int(fetch_cfg.get("timeout_sec", fetch_cfg.get("wait_seconds", 30)))
     fetch_every_sec = int(fetch_cfg.get("fetch_every_sec", 60))
     concurrency     = max(1, int(fetch_cfg.get("concurrency", 1)))
+
+    # ✅ yeni eklenenler (isimler birebir JSON’la aynı)
+    heartbeat_sec       = int(fetch_cfg.get("heartbeat_every_sec", 21600))  # 6 saat
+    stale_live_max_sec  = int(fetch_cfg.get("stale_live_max_sec", 600))     # 10 dk
+    stale_symbol_max_sec= int(fetch_cfg.get("stale_symbol_max_sec", 900))   # 15 dk
 
     # Başlatma mesajı (opsiyonel)
     try:
@@ -991,17 +1546,27 @@ async def main_trading(
             f"🗃️ <b>Veritabanı:</b> {DB_NAME}\n"
             f"📊 <b>Tablolar:</b>\n"
             f"  - Canlı: {GLOBAL_LIVE_TABLE}\n"
-            f"  - Kapanış: {GLOBAL_CLOSING_TABLE}\n"
+            f"  - Günlük Kapanış: {GLOBAL_CLOSING_TABLE}\n"
+            f"  - Periyot Kapanışları: global_close_15m / _1h / _4h\n"
         )
         if bots:
             send_telegram_message(message, "main_bot", bots)
     except Exception:
         logging.warning("Başlatma mesajı gönderilemedi.", exc_info=True)
 
-    # Sürekli döngü
+    # --- Sürekli döngü ---
     while True:
         try:
-            # --- Yalnızca Playwright ile fiyatları çek ---
+            # loop başında döngü zamanını güncelle
+            now = datetime.now(timezone.utc)
+            try:
+                
+                LAST_LOOP_TS = int(now.timestamp())
+            except Exception:
+                pass
+
+
+            # 1) Fiyatları çek (Playwright)
             prices = await fetch_multiple_prices_playwright(
                 symbols=symbols,
                 retries=retries,
@@ -1011,21 +1576,143 @@ async def main_trading(
 
             now = datetime.now(timezone.utc)
 
+            # Heartbeat: son döngü zamanını güncelle (tanımlıysa)
+            try:
+                
+                LAST_LOOP_TS = int(now.timestamp())
+            except Exception:
+                pass
+
+            # 2) Her sembol için işlemleri yap
             for symbol, price in prices.items():
                 if price is None:
-                    logging.warning(f"Price for {symbol} could not be fetched.")
+                    logging.warning(f"[{symbol}] price fetch failed (None).")
                     continue
 
-                # Limit kontrolü (yalnızca tanımlı semboller)
-                if symbol in LIMITS:
-                    check_price_limits(symbol, price, bots)
+                # 2.1) Limit kontrolü (tanımlı olanlarda)
+                try:
+                    if symbol in LIMITS:
+                        check_price_limits(symbol, price, bots)
+                except Exception:
+                    logging.exception(f"[{symbol}] limit kontrolü sırasında hata")
 
-                # Yüzde değişimleri hesapla & kaydet
-                changes = calculate_changes(cursor, symbol, price)
-                await save_live_data(cursor, conn, symbol, price, changes, now)
-                await save_closing_price(cursor, conn, symbol, price, now)
+                # 2.2) Yüzde değişimleri (kapanış referanslarına göre)
+                try:
+                    # Yeni imza: calculate_changes(cursor, symbol, price, now)
+                    changes = calculate_changes(cursor, symbol, price, now)
+                except TypeError:
+                    # Geri uyumluluk: eski imza (now parametresi yoksa)
+                    changes = calculate_changes(cursor, symbol, price)
+                except Exception:
+                    logging.exception(f"[{symbol}] change hesaplama hatası")
+                    changes = {
+                        "15M": None, "1H": None, "4H": None, "1D": None,
+                        "ch_15m": None, "ch_1h": None, "ch_4h": None, "ch_1d": None
+                    }
 
-            # JSON'dan gelen aralıkla bekle
+                # 2.3) Canlı veriyi kaydet
+                try:
+                    await save_live_data(cursor, conn, symbol, price, changes, now)
+                except Exception:
+                    logging.exception(f"[{symbol}] save_live_data hatası")
+
+                # 2.4) Periyot kapanışlarını UPSERT et (15m/1h/4h kovaları)
+                #     - Kova bitene kadar close_price güncellenir
+                #     - Kova bittiğinde aynı satır "kapanış" olur
+                try:
+                    save_period_close(cursor, conn, symbol, price, now, "15m")
+                    save_period_close(cursor, conn, symbol, price, now, "1h")
+                    save_period_close(cursor, conn, symbol, price, now, "4h")
+                except AssertionError:
+                    logging.error(f"[{symbol}] save_period_close yanlış timeframe parametresi")
+                except Exception:
+                    logging.exception(f"[{symbol}] save_period_close hatası")
+
+                # 2.5) Günlük kapanışı işle (aynı gün için ikinci kez yazmaz)
+                try:
+                    await save_closing_price(cursor, conn, symbol, price, now)
+                except Exception:
+                    logging.exception(f"[{symbol}] save_closing_price hatası")
+
+            # global ve sembol-bazlı “akış durdu mu?” kontrollerini yapar,
+            #  6 saatte bir (veya config’ten ayarlanabilir) heartbeat mesajı yollar.
+                        # 3) Döngü arası bekleme ÖNCESİ: Heartbeat & Stale kontrolleri
+            try:
+                now_epoch = int(now.timestamp())
+                global LAST_HEARTBEAT_TS, LAST_LIVE_INSERT_TS, SYMBOL_LAST_OK_TS
+
+                # Eşikler: fetch_cfg ile override edilebilir
+                hb_every      = int(fetch_cfg.get("heartbeat_every_sec", 6 * 60 * 60))   # 6 saat
+                stale_liveMax = int(fetch_cfg.get("stale_live_max_sec", 10 * 60))        # 10 dk
+                stale_symMax  = int(fetch_cfg.get("stale_symbol_max_sec", 15 * 60))      # 15 dk
+
+                # --- Global stale: son canlı insert çok eski mi? ---
+                try:
+                    if LAST_LIVE_INSERT_TS:
+                        delta_live = now_epoch - int(LAST_LIVE_INSERT_TS)
+                        if delta_live > stale_liveMax:
+                            msg = (
+                                f"⚠️ <b>Stale uyarısı</b>\n"
+                                f"Son canlı kayıt {delta_live} sn önce atıldı.\n"
+                                f"Beklenen max: {stale_liveMax} sn."
+                            )
+                            send_telegram_message(msg, "alerts_bot", bots)
+                            logging.warning(msg)
+                except Exception:
+                    logging.exception("Global stale kontrolü sırasında hata")
+
+                # --- Sembol-bazlı stale: hangi semboller gecikti? ---
+                try:
+                    late_syms = []
+                    if isinstance(SYMBOL_LAST_OK_TS, dict):
+                        for s in symbols:
+                            last_ok = int(SYMBOL_LAST_OK_TS.get(s, 0) or 0)
+                            if last_ok == 0:
+                                # henüz hiç başarı kaydı yoksa ilk turda es geçebiliriz
+                                continue
+                            if (now_epoch - last_ok) > stale_symMax:
+                                late_syms.append(s)
+                    if late_syms:
+                        msg = (
+                            "⚠️ <b>Sembol-bazlı gecikme</b>\n"
+                            f"Geciken: {', '.join(late_syms)}\n"
+                            f"Eşik: {stale_symMax} sn"
+                        )
+                        send_telegram_message(msg, "alerts_bot", bots)
+                        logging.warning(msg)
+                except Exception:
+                    logging.exception("Sembol-bazlı stale kontrolü sırasında hata")
+
+                # --- Heartbeat (periyodik) ---
+                try:
+                    need_hb = (LAST_HEARTBEAT_TS is None) or ((now_epoch - int(LAST_HEARTBEAT_TS)) >= hb_every)
+                    if need_hb:
+                        ok_count = 0
+                        if isinstance(SYMBOL_LAST_OK_TS, dict) and SYMBOL_LAST_OK_TS:
+                            ok_count = sum(1 for s in symbols
+                                           if int(SYMBOL_LAST_OK_TS.get(s, 0) or 0) >= (now_epoch - stale_symMax))
+                        loop_age = (now_epoch - int(LAST_LOOP_TS or now_epoch))
+                        live_age = (now_epoch - int(LAST_LIVE_INSERT_TS or now_epoch))
+
+                        hb_msg = (
+                            "💓 <b>Heartbeat</b>\n"
+                            f"OK Sembol: {ok_count}/{len(symbols)}\n"
+                            f"Son döngü: {loop_age} sn önce\n"
+                            f"Son canlı insert: {live_age} sn önce\n"
+                            f"DB: {DB_NAME}"
+                        )
+                        send_telegram_message(hb_msg, "main_bot", bots)
+                        logging.info("Heartbeat gönderildi.")
+                        LAST_HEARTBEAT_TS = now_epoch
+                except Exception:
+                    logging.exception("Heartbeat gönderimi sırasında hata")
+
+            except Exception:
+                logging.exception("Heartbeat & stale checks bloğu hata verdi")
+
+
+
+            # 3) Döngü arası bekleme
             await asyncio.sleep(fetch_every_sec)
 
         except Exception as e:
@@ -1036,23 +1723,31 @@ async def main_trading(
                 except Exception:
                     logging.warning("Telegram bildirimi gönderilemedi (loop error).")
 
+
 # Ana giriş noktası
 if __name__ == "__main__":
-    bots = {}     # Telegram config okunamazsa bile servis çalışsın
+    from pathlib import Path
+    import asyncio
+
+    bots: dict = {}
     conn = None
     cursor = None
 
+    # 0) Log sistemini başlat
+    LOG_PATH = os.path.join(LOG_DIR, "database_manager_5.log")
+    logger = setup_logging(LOG_PATH)
+
     try:
-        # 1) Global konfigürasyonu oku (tek kaynak)
+        # 1) Global konfigürasyonu oku
         with open(GLOBAL_CFG, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            fetch_cfg = cfg.get("fetch", {})  # Playwright parametreleri
+            fetch_cfg = cfg.get("fetch", {}) or {}
 
-        # 2) Log seviyesi (basicConfig sonrası level güncellenebilir)
+        # 2) Log seviyesi override (JSON'dan)
         level_name = (cfg.get("logging_level") or "INFO").upper()
-        logging.getLogger().setLevel(getattr(logging, level_name, logging.INFO))
+        logger.setLevel(getattr(logging, level_name, logging.INFO))
 
-        # 3) Paths override (ENV > JSON > defaults)
+        # 3) Paths override
         paths = cfg.get("paths") or {}
         db_override  = paths.get("db_path")
         log_override = paths.get("log_dir")
@@ -1061,60 +1756,55 @@ if __name__ == "__main__":
         if db_override and db_override != DB_NAME:
             DB_NAME = db_override
             Path(Path(DB_NAME).parent).mkdir(parents=True, exist_ok=True)
-            logging.info(f"DB_PATH override edildi: {DB_NAME}")
+            logger.info(f"DB_PATH override edildi: {DB_NAME}")
 
         if log_override and os.path.abspath(log_override) != os.path.abspath(LOG_DIR):
             Path(log_override).mkdir(parents=True, exist_ok=True)
-            logging.info(f"LOG_DIR (JSON) tespit edildi: {log_override} (handler runtime'da değiştirilmedi)")
+            logger.info(f"LOG_DIR (JSON) tespit edildi: {log_override} (handler runtime'da değiştirilmedi)")
 
         if telegram_cfg_override and os.path.abspath(telegram_cfg_override) != os.path.abspath(TELEGRAM_CFG):
             TELEGRAM_CFG = telegram_cfg_override
-            logging.info(f"TELEGRAM_CFG override edildi: {TELEGRAM_CFG}")
+            logger.info(f"TELEGRAM_CFG override edildi: {TELEGRAM_CFG}")
 
-        # 4) Telegram yapılandırmasını yükle (opsiyonel)
+        # 4) Telegram yapılandırması
         try:
             bots = load_telegram_config(TELEGRAM_CFG)
+            logger.info("Telegram configuration loaded successfully.")
         except FileNotFoundError:
-            logging.warning(f"Telegram config bulunamadı, devam: {TELEGRAM_CFG}")
-            bots = {}
+            logger.warning(f"Telegram config bulunamadı, devam: {TELEGRAM_CFG}")
         except PermissionError:
-            logging.error(f"Telegram config izin hatası, Telegram devre dışı: {TELEGRAM_CFG}")
-            bots = {}
+            logger.error(f"Telegram config izin hatası, Telegram devre dışı: {TELEGRAM_CFG}")
         except Exception:
-            logging.exception("Telegram config yüklenemedi, Telegram devre dışı")
-            bots = {}
+            logger.exception("Telegram config yüklenemedi, Telegram devre dışı")
 
-        # 5) Veritabanı bağlantısı + tablolar
+        # 5) Veritabanı bağlantısı
         conn, cursor = connect_db()
         if not conn or not cursor:
             raise ConnectionError("Failed to connect to the database.")
-
         create_global_tables(cursor)
         conn.commit()
 
-        # 6) Semboller (symbols veya global_symbols anahtarını destekle)
+        # 6) Semboller
         global_symbols = cfg.get("symbols") or cfg.get("global_symbols") or []
         if not global_symbols:
-            raise ValueError(
-                "No symbols found. Lütfen global_data_config.json içinde "
-                "'symbols' veya 'global_symbols' anahtarını doldurun."
-            )
-        logging.info(f"Loaded global symbols: {global_symbols}")
+            raise ValueError("No symbols found. Lütfen config dosyasını kontrol edin.")
+        logger.info(f"Loaded global symbols: {global_symbols}")
 
-        # 7) Price limits (JSON varsa sabiti güncelle)
+        # 7) Price limits
         if "price_limits" in cfg and isinstance(cfg["price_limits"], dict):
             LIMITS.clear()
             LIMITS.update(cfg["price_limits"])
 
-        # 8) Retention: doğru tablo adları + kısa ad desteği
-        # JSON önerilen: {"global_live_data":5000,"global_closing_data":8000}
-        # Eski alışkanlık için destek: {"global_live":5000,"global_closing":8000}
+        # 8) Retention
         if "retention" in cfg and isinstance(cfg["retention"], dict):
             mapping = {
                 "global_live": GLOBAL_LIVE_TABLE,
                 "global_closing": GLOBAL_CLOSING_TABLE,
                 GLOBAL_LIVE_TABLE: GLOBAL_LIVE_TABLE,
                 GLOBAL_CLOSING_TABLE: GLOBAL_CLOSING_TABLE,
+                "global_close_15m": "global_close_15m",
+                "global_close_1h":  "global_close_1h",
+                "global_close_4h":  "global_close_4h",
             }
             for key, limit in cfg["retention"].items():
                 table = mapping.get(key)
@@ -1122,54 +1812,54 @@ if __name__ == "__main__":
                     try:
                         RECORD_LIMITS[table] = int(limit)
                     except Exception:
-                        logging.warning(f"Retention değeri sayıya çevrilemedi: {key} -> {limit}")
+                        logger.warning(f"Retention değeri sayıya çevrilemedi: {key} -> {limit}")
                 else:
-                    logging.warning(f"Bilinmeyen retention anahtarı: {key}")
+                    logger.warning(f"Bilinmeyen retention anahtarı: {key}")
 
-        # 9) Ana işlem döngüsü (yalnızca Playwright toplayıcı)
+        # 9) Ana işlem döngüsü
         asyncio.run(main_trading(global_symbols, bots, conn, cursor, fetch_cfg))
 
     except FileNotFoundError as e:
-        logging.error(f"File not found: {e}", exc_info=True)
+        logger.error(f"File not found: {e}", exc_info=True)
         if bots:
             try:
                 send_telegram_message(f"❌ Configuration file error: {e}", "main_bot", bots)
             except Exception:
-                logging.warning("Telegram bildirimi gönderilemedi (FileNotFoundError).")
+                logger.warning("Telegram bildirimi gönderilemedi (FileNotFoundError).")
 
     except ConnectionError as e:
-        logging.error(f"Database connection error: {e}", exc_info=True)
+        logger.error(f"Database connection error: {e}", exc_info=True)
         if bots:
             try:
                 send_telegram_message(f"❌ Database connection error: {e}", "main_bot", bots)
             except Exception:
-                logging.warning("Telegram bildirimi gönderilemedi (ConnectionError).")
+                logger.warning("Telegram bildirimi gönderilemedi (ConnectionError).")
 
     except ValueError as e:
-        logging.error(f"Configuration error: {e}", exc_info=True)
+        logger.error(f"Configuration error: {e}", exc_info=True)
         if bots:
             try:
                 send_telegram_message(f"❌ Configuration error: {e}", "main_bot", bots)
             except Exception:
-                logging.warning("Telegram bildirimi gönderilemedi (ValueError).")
+                logger.warning("Telegram bildirimi gönderilemedi (ValueError).")
 
     except Exception as e:
-        logging.error(f"Unexpected fatal error: {e}", exc_info=True)
+        logger.error(f"Unexpected fatal error: {e}", exc_info=True)
         if bots:
             try:
                 send_telegram_message(f"❌ Fatal Error: {e}", "main_bot", bots)
             except Exception:
-                logging.warning("Telegram bildirimi gönderilemedi (Fatal).")
+                logger.warning("Telegram bildirimi gönderilemedi (Fatal).")
 
     finally:
         try:
             if conn:
                 conn.close()
-                logging.info("Database connection closed.")
+                logger.info("Database connection closed.")
                 if bots:
                     try:
                         send_telegram_message("🔌 Database connection closed.", "main_bot", bots)
                     except Exception:
-                        logging.warning("Telegram bildirimi gönderilemedi (shutdown).")
+                        logger.warning("Telegram bildirimi gönderilemedi (shutdown).")
         except Exception:
-            logging.exception("DB kapanışı sırasında hata")
+            logger.exception("DB kapanışı sırasında hata")

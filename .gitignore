@@ -90,3 +90,4 @@ selenium-screenshots/
 # Personal notes
 yapilacaklar.txt
 globalislemler/yapilacaklar.txt
+*.bak.*

@@ -19,14 +19,28 @@
  
   
   "fetch": {
-    "engine": "playwright",
-    "retries": 3,
-    "timeout_sec": 30,
-    "fetch_every_sec": 30,
-   "  concurrency": 2
-  
-   
+  "engine": "playwright",
+  "retries": 3,
+  "timeout_sec": 30,
+  "fetch_every_sec": 30,
+  "concurrency": 1,
+  "heartbeat_every_sec": 21600,
+  "stale_live_max_sec": 600,
+  "stale_symbol_max_sec": 900
+},
+
+
+  "health": {
+  "enabled": true,
+  "every_sec": 21600,
+  "stale_sec": 600,
+  "bot_name": "main_bot",
+  "include_db_stats": true,
+  "include_symbol_samples": true,
+  "n8n_webhook_url": "",
+  "n8n_auth_header": ""
   },
+
   "price_limits": {
     "CRYPTOCAP:USDT.D": {
       "lower": 3.0,
@@ -43,6 +57,9 @@
   },
   "retention": {
     "global_live": 5000,
-    "global_closing": 8000
+    "global_closing": 8000,
+    "global_close_15m": 100000,
+  "global_close_1h": 50000,
+  "global_close_4h": 30000
   }
 }

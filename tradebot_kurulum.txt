@@ -90,3 +90,58 @@ HTML veya içerik eklemek istiyorsan: Flask içinde render_template() ile HTML d
 
 sudo rm /etc/nginx/sites-enabled/tradebot
 Bu, tradebot yapılandırmasını devre dışı bırakır ama silmez. Dosya hâlâ sites-available içinde durur.
+
+SYSTEMD Uygulama komut ve işlemier
+
+systemd edit: sudo systemctl edit tradebot-global.service
+doğrudan dosyayı da açma komutu: sudo nano /etc/systemd/system/tradebot-global.service.d/override.conf
+
+Doğrula:    systemctl cat tradebot-global.service
+            systemctl show -p Restart,RestartUSec,KillMode,TimeoutStopUSec,StartLimitIntervalUSec,StartLimitBurst tradebot-global.service
+            journalctl -fu tradebot-global.service
+
+
+
+Mevcut drop-in klasörünü ve kalıntıları gör: sudo ls -la /etc/systemd/system/tradebot-global.service.d
+
+Tüm systemd override dizinlerini taramak: sudo find /etc/systemd/system/ -type f \( -name '*~' -o -name '#*#' -o -name '.#*' \)
+
+Temizleme: sudo find /etc/systemd/system/ -type f \( -name '*~' -o -name '#*#' -o -name '.#*' \) -exec rm -f {} +
+
+Kalıntıları sil:    sudo rm -f /etc/systemd/system/tradebot-global.service.d/.#override.conf*
+                    sudo rm -f /etc/systemd/system/tradebot-global.service.d/#override.conf#
+                    sudo rm -f /etc/systemd/system/tradebot-global.service.d/override.conf~
+
+
+systemd’yi yenile ve servisi başlat:    sudo systemctl daemon-reload
+                                        sudo systemctl restart tradebot-global.service
+
+KONTROL LİSTESİ (Hızlı doğrulama)
+systemd
+# Drop-in içerik kontrol
+systemctl cat tradebot-global.service
+
+# Parametrelerin yüklendiğini doğrula
+systemctl show -p Restart,RestartUSec,KillMode,TimeoutStopUSec,StartLimitIntervalUSec,StartLimitBurst tradebot-global.service
+# beklenen: Restart=on-failure, RestartUSec=5s, KillMode=control-group, TimeoutStopUSec=30s, StartLimitIntervalUSec=1min, StartLimitBurst=8
+
+# Canlı log
+journalctl -fu tradebot-global.service
+
+Playwright depoları & izinler
+sudo install -d -o selbir -g selbir -m 775 /opt/tradebot/tmp/chrome-profiles
+sudo install -d -o selbir -g selbir -m 775 /opt/tradebot/pw-browsers
+
+DB şema & veri akışı
+# periyot kapanış tabloları
+sqlite3 /opt/tradebot/veritabani/global_data.db ".schema global_close_15m"
+sqlite3 /opt/tradebot/veritabani/global_data.db "SELECT * FROM global_close_15m ORDER BY ts_bucket_utc DESC LIMIT 3;"
+sqlite3 /opt/tradebot/veritabani/global_data.db "SELECT * FROM global_close_1h  ORDER BY ts_bucket_utc DESC LIMIT 3;"
+sqlite3 /opt/tradebot/veritabani/global_data.db "SELECT * FROM global_close_4h  ORDER BY ts_bucket_utc DESC LIMIT 3;"
+
+# günlük kapanış
+sqlite3 /opt/tradebot/veritabani/global_data.db ".schema global_closing_data"
+sqlite3 /opt/tradebot/veritabani/global_data.db "SELECT timestamp,symbol,price,interval FROM global_closing_data ORDER BY timestamp DESC LIMIT 3;"
+
+# canlı akış
+sqlite3 /opt/tradebot/veritabani/global_data.db "SELECT * FROM global_live_data ORDER BY timestamp DESC LIMIT 3;"

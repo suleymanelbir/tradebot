@@ -20,3 +20,31 @@ CRYPTOCAP:USDT.D
 CRYPTOCAP:BTC.D
 CRYPTOCAP:TOTAL3
 -----------------------------------
+
+
+sqlite3 /opt/tradebot/veritabani/global_data.db ".schema global_live_data"
+CREATE TABLE global_live_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME,
+            symbol TEXT,
+            live_price FLOAT,
+            change_15M FLOAT,
+            change_1H FLOAT,
+            change_4H FLOAT,
+            change_1D FLOAT
+        );
+(trade_env) selbir@localhost:/opt/tradebot/veritabani$ sqlite3 /opt/tradebot/veritabani/global_data.db ".schema global_closing_data"
+CREATE TABLE global_closing_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME,
+            symbol TEXT,
+            price FLOAT,
+            interval TEXT,
+            UNIQUE(symbol, timestamp, interval)
+        );
+(trade_env) selbir@localhost:/opt/tradebot/veritabani$ sqlite3 /opt/tradebot/veritabani/global_data.db "PRAGMA table_info(global_closing_data);"
+0|id|INTEGER|0||1
+1|timestamp|DATETIME|0||0
+2|symbol|TEXT|0||0
+3|price|FLOAT|0||0
+4|interval|TEXT|0||0
