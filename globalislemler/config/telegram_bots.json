@@ -1,6 +1,6 @@
 {
   "bots": [
     { "name": "main_bot",   "token": "6019342826:AAH126ohgk-b1-KwoPzFQAFqJpDSavuSFKM", "chat_id": "6074683065" },
-    { "name": "alerts_bot", "token": "7141696556:AAEl1kISVim-l8kR6kz91OEww7ramNHXxcg", "chat_id": "166381056" }
+    { "name": "alerts_bot", "token": "7032397657:AAFrAeWjOVt0MnbhLw3M5lEfMdLX5cbxuSg", "chat_id": "6074683065" }
   ]
 }
