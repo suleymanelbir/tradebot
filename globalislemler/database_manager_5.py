@@ -35,6 +35,8 @@ import random
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import math
+from typing import Tuple
 
 # ─────────────────────────────────────────────
 # 🧠 Tip Belirtimleri
@@ -50,7 +52,11 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # 🌐 HTTP İstekleri
 # ─────────────────────────────────────────────
+
 import requests
+import time
+import logging
+import html
 
 # ─────────────────────────────────────────────
 # 🎭 Playwright (aktif kullanım için açık bırakıldı)
@@ -149,6 +155,52 @@ ALERT_COOLDOWN_SEC = 900  # 15 dk
 
 # 🧠 JSON'dan yüklenecek sağlık konfigürasyonu
 HEALTH_CFG: Dict[str, Any] = {}
+
+# USDT.D / BTC.D yüzde cinsinden -> 0.01% mutlak tolerans (1 bp)
+# TOTAL, TOTAL2, TOTAL3 market cap -> çok küçük göreli tolerans + 1 birim mutlak
+PRICE_TOLERANCES = {
+    "CRYPTOCAP:USDT.D": {"abs": 0.01, "rel": 0.0},
+    "CRYPTOCAP:BTC.D":  {"abs": 0.01, "rel": 0.0},
+    "CRYPTOCAP:TOTAL":  {"abs": 1.0,  "rel": 1e-12},
+    "CRYPTOCAP:TOTAL2": {"abs": 1.0,  "rel": 1e-12},
+    "CRYPTOCAP:TOTAL3": {"abs": 1.0,  "rel": 1e-12},
+}
+
+# Varsayılan (diğer semboller): makul bir tolerans
+DEFAULT_REL_TOL = 1e-9
+DEFAULT_ABS_TOL = 1e-8
+
+# Zorunlu snapshot aralığı (saniye)
+FORCE_SAVE_INTERVAL_SEC = 300  # 5 dakika
+
+def get_tolerances(symbol: str) -> Tuple[float, float]:
+    cfg = PRICE_TOLERANCES.get(symbol, {})
+    abs_tol = float(cfg.get("abs", DEFAULT_ABS_TOL))
+    rel_tol = float(cfg.get("rel", DEFAULT_REL_TOL))
+    return rel_tol, abs_tol
+
+def prices_equivalent(new_price: float, last_price: float, symbol: str) -> bool:
+    rel_tol, abs_tol = get_tolerances(symbol)
+    return math.isclose(float(new_price), float(last_price),
+                        rel_tol=rel_tol, abs_tol=abs_tol)
+
+def should_force_save(symbol: str, now_dt, symbol_last_ok_ts: dict) -> bool:
+    """
+    symbol_last_ok_ts: SYMBOL_LAST_OK_TS sözlüğünüz (symbol -> epoch seconds)
+    """
+    try:
+        last_ok_epoch = symbol_last_ok_ts.get(symbol)
+        if last_ok_epoch is None:
+            return True  # İlk kayıt
+        # now_dt aware/naive olabilir; epoch'a çevir
+        now_epoch = getattr(now_dt, "timestamp", lambda: None)()
+        if now_epoch is None:
+            import time as _t
+            now_epoch = _t.time()
+        return (now_epoch - last_ok_epoch) >= FORCE_SAVE_INTERVAL_SEC
+    except Exception:
+        return True
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -499,64 +551,142 @@ async def fetch_multiple_prices_playwright(
 # 6) GİRİŞ NOKTASI
 # ─────────────────────────────────────────────────────────────
 
-# Telegram mesaj gönderme fonksiyonu
+# Telegram mesaj gönderme fonksiyonu (güncellenmiş)
 def send_telegram_message(message: str, bot_name: str, bots: dict, retries: int = 3, timeout: int = 10):
     """
-    Sends a message to a Telegram bot.
-
-    Args:
-        message (str): The message to send.
-        bot_name (str): The name of the bot as defined in the configuration.
-        bots (dict): A dictionary of bot configurations.
-        retries (int): The number of retry attempts on failure.
-        timeout (int): Timeout for the HTTP request in seconds.
-
-    Raises:
-        ValueError: If the bot configuration is missing or invalid.
-        Exception: If all retries fail to send the message.
+    Robust Telegram sender:
+    - Logs Telegram response body on 4xx/5xx
+    - Splits long texts (>4096)
+    - Falls back from HTML to plain text on parse errors
+    - Detects 'chat not found' / 403 and stops retrying
+    - Respects 429 Retry-After (doesn't consume attempts)
+    - Exponential backoff with jitter
     """
-    import requests
-    import time
+    import requests, time, logging, html, random
 
-    # Validate bot configuration
-    bot_config = bots.get(bot_name)
-    if not bot_config:
-        raise ValueError(f"Bot configuration for '{bot_name}' not found.")
-    if not bot_config.get("token") or not bot_config.get("chat_id"):
-        raise ValueError(f"Bot configuration for '{bot_name}' is incomplete. Please check 'token' and 'chat_id'.")
+    MAX_LEN = 4096
 
-    # Construct the Telegram API URL
-    url = f"https://api.telegram.org/bot{bot_config['token']}/sendMessage"
+    def _split(msg: str) -> list[str]:
+        if msg is None:
+            return [""]
+        msg = str(msg)
+        if len(msg) <= MAX_LEN:
+            return [msg]
+        parts, rest = [], msg
+        while len(rest) > MAX_LEN:
+            cut = rest.rfind('\n', 0, MAX_LEN)
+            if cut == -1 or cut < int(MAX_LEN * 0.6):
+                cut = MAX_LEN
+            parts.append(rest[:cut])
+            rest = rest[cut:]
+        if rest:
+            parts.append(rest)
+        return parts
 
-    for attempt in range(retries):
+    def _log_body(resp):
         try:
+            logging.error(f"Telegram response body: {resp.text}")
+        except Exception:
+            pass
+
+    # --- Config checks
+    bot = bots.get(bot_name) if isinstance(bots, dict) else None
+    if not bot or not bot.get("token") or not bot.get("chat_id"):
+        raise ValueError(f"Invalid bot config for '{bot_name}'. Check 'token' and 'chat_id'.")
+
+    if message is None or not str(message).strip():
+        raise ValueError("Telegram: Empty message cannot be sent.")
+
+    url = f"https://api.telegram.org/bot{bot['token']}/sendMessage"
+    chat_id = str(bot["chat_id"])  # güvenli tarafta kal
+    chunks = _split(str(message))
+
+    # Uzun metinlerde HTML tag bölünmesini önlemek için baştan düz metin tercih et
+    prefer_plain_for_all = (len(chunks) > 1)
+
+    for idx, chunk in enumerate(chunks, 1):
+        try_html = (not prefer_plain_for_all)  # kısa tek parça ise önce HTML dene
+        attempt = 0
+        sent = False
+
+        while attempt < retries and not sent:
             payload = {
-                "chat_id": bot_config["chat_id"],
-                "text": message,
-                "parse_mode": "HTML"
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": True,
+                "disable_notification": False
             }
-            logging.debug(f"Sending message using bot '{bot_name}': {payload}")
-            response = requests.post(url, json=payload, timeout=timeout)
-            response.raise_for_status()  # Raise an error for non-2xx responses
-            logging.info(f"Message sent successfully using bot '{bot_name}': {message}")
-            return  # Exit on successful send
+            if try_html:
+                payload["parse_mode"] = "HTML"
 
-        except requests.Timeout:
-            logging.warning(f"Timeout occurred while sending message using bot '{bot_name}', Attempt {attempt + 1}/{retries}.")
+            try:
+                r = requests.post(url, json=payload, timeout=timeout)
 
-        except requests.RequestException as e:
-            logging.error(f"Request error while sending message using bot '{bot_name}', Attempt {attempt + 1}/{retries}: {e}")
+                # 4xx/5xx için gövdeyi logla
+                if r.status_code >= 400:
+                    _log_body(r)
+                    body = (r.text or "").lower()
 
-        # Wait before retrying (exponential backoff)
-        if attempt < retries - 1:
-            backoff_time = 2 ** attempt
-            logging.info(f"Retrying in {backoff_time} seconds...")
-            time.sleep(backoff_time)
+                    # 403 => bot engellenmiş / yetkisiz → retry etme
+                    if r.status_code == 403 or "forbidden" in body or "bot was blocked" in body:
+                        logging.error(f"Forbidden/blocked for bot '{bot_name}' and chat_id '{chat_id}'.")
+                        break  # attempt harcamayı bırak
 
-    # If all retries fail
-    error_message = f"Failed to send Telegram message after {retries} attempts using bot '{bot_name}'."
-    logging.error(error_message)
-    raise Exception(error_message)
+                    # 429 => hız limiti → Retry-After'a saygı duy, attempt'ı tüketme
+                    if r.status_code == 429 or "too many requests" in body:
+                        # Telegram çoğu zaman Retry-After döndürür
+                        ra = r.headers.get("Retry-After")
+                        wait_sec = int(ra) if ra and ra.isdigit() else 3
+                        # küçük jitter
+                        wait_sec = max(1, wait_sec) + random.uniform(0, 0.5)
+                        logging.warning(f"Rate limited (429). Waiting {wait_sec:.2f}s then retrying (won't consume attempt).")
+                        time.sleep(wait_sec)
+                        # attempt'ı tüketmemek için azalt
+                        # (bu döngünün başında artıracağız)
+                        # NOT: Burada attempt zaten artırılmadıysa değiştirmeye gerek yok; ama biz başta artıracağız:
+                        # Bu nedenle önce attempt artırma modelini değiştiriyoruz:
+                        # -> attempt artırmayı request'ten SONRA yapacağız.
+                        # Ancak mevcut yapıyı bozmayalım; pratik çözüm:
+                        attempt -= 1
+                        continue
+
+                    # chat not found → retry etmeye gerek yok
+                    if "chat not found" in body:
+                        logging.error(f"Telegram chat_id not found for bot '{bot_name}': {chat_id}")
+                        break
+
+                    # HTML parse hatası → düz metne düş
+                    if "can't parse entities" in body or "parse" in body and "html" in body:
+                        logging.warning(f"Telegram HTML parse hatası ({bot_name}) part {idx}; düz metne geçiliyor.")
+                        try_html = False
+                        chunk = html.unescape(chunk)
+                        # aynı attempt'i tüketmeden tekrar dene
+                        attempt -= 1
+                        continue
+
+                r.raise_for_status()
+                logging.info(f"Telegram OK ({bot_name}) part {idx}/{len(chunks)}")
+                sent = True
+
+            except requests.Timeout:
+                logging.warning(f"Telegram timeout ({bot_name}) try {attempt+1}/{retries} (part {idx}).")
+            
+            except requests.RequestException as e:
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    _log_body(resp)
+                logging.error(f"Telegram error ({bot_name}) try {attempt+1}/{retries} (part {idx}): {e}")
+
+            # next attempt (exponential backoff + jitter), eğer gönderilemediyse
+            if not sent:
+                attempt += 1
+                if attempt < retries:
+                    backoff = (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                    logging.info(f"Retrying in {backoff:.2f}s...")
+                    time.sleep(backoff)
+
+        if not sent:
+            raise Exception(f"Failed to send Telegram message for '{bot_name}' after {retries} tries (part {idx}).")
 
 
 def send_startup_info():
@@ -1082,13 +1212,24 @@ async def save_closing_price(
 async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
     """
     Canlı fiyatı ve yüzde değişimlerini veritabanına yazar.
+
+    Eklemeler:
+      - Fiyat eşitliği toleranslı kontrol (symbol bazlı abs/rel tolerans).
+      - Uzun süre değişim yoksa zorunlu snapshot (default 5 dk).
+      - Zaman damgası to_sqlite_dt(now) ile ISO string olarak yazılır.
+      - Uyarılar Telegram'a JSON formatında iletilir (parse sorunlarını azaltır).
+
     Notlar:
-      - Fonksiyon yapısı korunmuştur (imza ve akış).
-      - CRYPTOCAP:USDT.D için emniyet bandı kontrolü (3–8) sürer.
+      - İmza ve genel akış korunmuştur.
+      - CRYPTOCAP:USDT.D için emniyet bandı (3–8) KORUNDU (band dışıysa kayıt yapılmaz).
       - Kayıt başarılı olursa heartbeat sayaçları güncellenir:
           LAST_LIVE_INSERT_TS ve SYMBOL_LAST_OK_TS[symbol]
       - Telegram gönderimleri güvenli-opsiyonel (bots global değişkeninden okunur).
     """
+    # ----------------------------- Hazırlık -----------------------------
+    from datetime import datetime, timezone
+    import math, json, time, logging, sqlite3
+
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -1098,7 +1239,53 @@ async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
     except Exception:
         clean_sym = symbol
 
-    # Yalnızca CRYPTOCAP:USDT.D için alt/üst limit kontrolü
+    # --- İç yardımcılar (dosyayı bozmamak için fonksiyon içi tanımlandı) ---
+    PRICE_TOLERANCES = {
+        # Yüzdelikler için makul abs tolerans (0.01 birim ~ 1bp)
+        "CRYPTOCAP:USDT.D": {"abs": 0.01, "rel": 0.0},
+        "CRYPTOCAP:BTC.D":  {"abs": 0.01, "rel": 0.0},
+        # Market cap tarafında çok küçük göreli tolerans + 1 birim mutlak tampon
+        "CRYPTOCAP:TOTAL":  {"abs": 1.0,  "rel": 1e-12},
+        "CRYPTOCAP:TOTAL2": {"abs": 1.0,  "rel": 1e-12},
+        "CRYPTOCAP:TOTAL3": {"abs": 1.0,  "rel": 1e-12},
+    }
+    DEFAULT_REL_TOL = 1e-9
+    DEFAULT_ABS_TOL = 1e-8
+
+    def _get_tolerances(sym: str):
+        cfg = PRICE_TOLERANCES.get(sym, {})
+        return float(cfg.get("rel", DEFAULT_REL_TOL)), float(cfg.get("abs", DEFAULT_ABS_TOL))
+
+    def _prices_equivalent(new_p: float, last_p: float, sym: str) -> bool:
+        rel, abs_ = _get_tolerances(sym)
+        return math.isclose(float(new_p), float(last_p), rel_tol=rel, abs_tol=abs_)
+
+    FORCE_SAVE_INTERVAL_SEC = 300  # 5 dk
+
+    def _should_force_save(sym: str, now_dt, sym_last_ok: dict) -> bool:
+        try:
+            last_ok_epoch = sym_last_ok.get(sym)
+            if last_ok_epoch is None:
+                return True  # İlk kayıt
+            try:
+                now_epoch = int(now_dt.timestamp())
+            except Exception:
+                now_epoch = int(time.time())
+            return (now_epoch - last_ok_epoch) >= FORCE_SAVE_INTERVAL_SEC
+        except Exception:
+            return True
+
+    def _send_alert_json(event: str, **fields):
+        """alerts_bot'a JSON metin olarak uyarı gönderir; başarısızlık durumunda sessiz geçer."""
+        try:
+            _bots = globals().get("bots", {})
+            payload = {"event": event, "ts": int(time.time()), **fields}
+            text = json.dumps(payload, ensure_ascii=False)
+            send_telegram_message(text, "alerts_bot", _bots)  # parse-mode otomatik yönetiliyor
+        except Exception:
+            pass
+
+    # ----------------------- USDT.D emniyet bandı ----------------------
     if clean_sym == "CRYPTOCAP:USDT.D":
         MIN_PRICE_LIMIT = 3.0
         MAX_PRICE_LIMIT = 8.0
@@ -1107,18 +1294,15 @@ async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
                 f"Live price for {clean_sym} is out of bounds: {live_price}. "
                 f"Must be between {MIN_PRICE_LIMIT} and {MAX_PRICE_LIMIT}."
             )
-            try:
-                _bots = globals().get("bots", {})
-                send_telegram_message(
-                    f"⚠️ Live price for {clean_sym} out of bounds: {live_price}. Ignored.",
-                    "alerts_bot",
-                    _bots,
-                )
-            except Exception:
-                pass
-            return  # Limit dışındaki fiyatlar için kayıt yapmıyoruz
+            _send_alert_json(
+                "out_of_bounds",
+                symbol=clean_sym, price=float(live_price),
+                min=MIN_PRICE_LIMIT, max=MAX_PRICE_LIMIT,
+                note="ignored"
+            )
+            return  # Band dışı → kayıt yapılmaz (mevcut davranış KORUNDU)
 
-    # Son fiyatı kontrol et (değişmemişse yazma)
+    # --------------------- Son fiyatı toleranslı kontrol ---------------------
     try:
         cursor.execute(
             """
@@ -1133,38 +1317,34 @@ async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
         row = cursor.fetchone()
         if row is not None:
             last_price = float(row[0])
-            if live_price == last_price:
-                logging.info(f"No change in live price for {clean_sym}. Skipping save.")
+            force_save = _should_force_save(clean_sym, now, globals().get("SYMBOL_LAST_OK_TS", {}))
+            if _prices_equivalent(live_price, last_price, clean_sym) and not force_save:
+                logging.info(f"No material change in live price for {clean_sym}. Skipping save.")
                 return
     except Exception as e:
         # Son fiyat okuma başarısız olsa bile yazımı denemeye devam ederiz
         logging.debug(f"Last-price lookup failed for {clean_sym}: {e}")
 
-    # changes sözlüğündeki olası iki anahtar şemasını da destekle
-    ch_15m = changes.get("15M")
-    if ch_15m is None:
-        ch_15m = changes.get("ch_15m")
+    # ----------------------- changes alanlarını topla -----------------------
+    ch_15m = changes.get("15M", changes.get("ch_15m"))
+    ch_1h  = changes.get("1H",  changes.get("ch_1h"))
+    ch_4h  = changes.get("4H",  changes.get("ch_4h"))
+    ch_1d  = changes.get("1D",  changes.get("ch_1d"))
 
-    ch_1h = changes.get("1H")
-    if ch_1h is None:
-        ch_1h = changes.get("ch_1h")
+    # ----------------------- INSERT (ISO zaman damgası) ----------------------
+    try:
+        ts_text = to_sqlite_dt(now)  # 'YYYY-MM-DD HH:MM:SS' (UTC) – dosyada mevcut yardımcı
+    except Exception:
+        # Yedek: ISO8601'e düş
+        ts_text = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    ch_4h = changes.get("4H")
-    if ch_4h is None:
-        ch_4h = changes.get("ch_4h")
-
-    ch_1d = changes.get("1D")
-    if ch_1d is None:
-        ch_1d = changes.get("ch_1d")
-
-    # INSERT
     sql = """
         INSERT INTO global_live_data (
             timestamp, symbol, live_price, change_15M, change_1H, change_4H, change_1D
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """
     params = (
-        now,
+        ts_text,
         clean_sym,
         float(live_price),
         None if ch_15m is None else float(ch_15m),
@@ -1202,41 +1382,17 @@ async def save_live_data(cursor, conn, symbol, live_price, changes, now=None):
     except sqlite3.IntegrityError as e:
         conn.rollback()
         logging.warning(f"Integrity error while saving live data for {clean_sym}: {e}")
-        try:
-            _bots = globals().get("bots", {})
-            send_telegram_message(
-                f"⚠️ Integrity error: Could not save data for {clean_sym}.",
-                "alerts_bot",
-                _bots,
-            )
-        except Exception:
-            pass
+        _send_alert_json("db_integrity_error", symbol=clean_sym, error=str(e))
 
     except sqlite3.OperationalError as e:
         conn.rollback()
         logging.error(f"Operational error while saving live data for {clean_sym}: {e}")
-        try:
-            _bots = globals().get("bots", {})
-            send_telegram_message(
-                f"⚠️ Database error: Could not save data for {clean_sym}.",
-                "alerts_bot",
-                _bots,
-            )
-        except Exception:
-            pass
+        _send_alert_json("db_operational_error", symbol=clean_sym, error=str(e))
 
     except Exception as e:
         conn.rollback()
         logging.error(f"Unexpected error saving live data for {clean_sym}: {e}")
-        try:
-            _bots = globals().get("bots", {})
-            send_telegram_message(
-                f"❌ Unexpected error: Could not save data for {clean_sym}. Error: {str(e)}",
-                "alerts_bot",
-                _bots,
-            )
-        except Exception:
-            pass
+        _send_alert_json("db_unexpected_error", symbol=clean_sym, error=str(e))
 
     finally:
         logging.debug(f"Save live data operation completed for {clean_sym}.")
@@ -1394,8 +1550,7 @@ def reconnect_db(conn, cursor):
             logging.warning(f"Error closing database connection: {e}")
     return connect_db()
 
-lock = asyncio.Lock()
-last_cleanup_time = datetime.now()
+
 
 
 async def run_fetching_cycle(
@@ -1770,6 +1925,9 @@ if __name__ == "__main__":
         try:
             bots = load_telegram_config(TELEGRAM_CFG)
             logger.info("Telegram configuration loaded successfully.")
+            send_telegram_message("✅ alerts_bot ping", "alerts_bot", bots)
+            send_telegram_message("✅ main_bot ping",   "main_bot",   bots)
+
         except FileNotFoundError:
             logger.warning(f"Telegram config bulunamadı, devam: {TELEGRAM_CFG}")
         except PermissionError:
@@ -1851,15 +2009,4 @@ if __name__ == "__main__":
             except Exception:
                 logger.warning("Telegram bildirimi gönderilemedi (Fatal).")
 
-    finally:
-        try:
-            if conn:
-                conn.close()
-                logger.info("Database connection closed.")
-                if bots:
-                    try:
-                        send_telegram_message("🔌 Database connection closed.", "main_bot", bots)
-                    except Exception:
-                        logger.warning("Telegram bildirimi gönderilemedi (shutdown).")
-        except Exception:
-            logger.exception("DB kapanışı sırasında hata")
+ 
