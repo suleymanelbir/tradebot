@@ -80,21 +80,6 @@ class FonksiyonZiyaretci(ast.NodeVisitor):
             self.import_edilen_kutuphaneler.add(alias.name.split('.')[0])
         self.generic_visit(node)
 
-    def visit_ImportFrom(self, node):
-        if node.module:
-            self.import_edilen_kutuphaneler.add(node.module.split('.')[0])
-        self.generic_visit(node)
-
-    def visit_Attribute(self, node):
-        if isinstance(node.value, ast.Name):
-            self.kullanilan_kutuphaneler.add(node.value.id)
-        self.generic_visit(node)
-
-    def visit_Name(self, node):
-        if isinstance(node.ctx, ast.Load):
-            self.kullanilan_kutuphaneler.add(node.id)
-        self.generic_visit(node)
-
 def kontrol_parantez_dengesi_detayli(kaynak_kod: str) -> Tuple[bool, List[str]]:
     """Detaylı parantez, köşeli parantez ve süslü parantez dengesi kontrolü"""
     hatalar = []
