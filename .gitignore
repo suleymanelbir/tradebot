@@ -91,3 +91,9 @@ selenium-screenshots/
 yapilacaklar.txt
 globalislemler/yapilacaklar.txt
 *.bak.*
+
+# -- 11) test ve analizler için kullanıland dosyalrın çıktılarını içeren dosyalar
+
+veritabani/analiz_raporu.csv
+veritabani/global_data_dna_raporu.json
+veritabani/global_data.dbsqlite3
