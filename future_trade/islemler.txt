@@ -1,1 +1,14 @@
 yapılan işlemler ve açıklamalrı buraya yaılacak ve takip eilecek
+testnet: api: key":     "0c6040b0417201cc289f882b5e57c7b4454b4c5e5984659fc9c90a514718e8f8",
+            "secret":   "bde9e1e707d9e4a4c0e891301de3e5d29f73ace510479e2e141886698dd0a4a1",
+
+gerçek api:"key": "UvePQzRE6I0777UcGYmUgsqisejiIxeCSlKFG042gjrSvKGDxnv7fFauYT45WJrd",
+"secret": "5oPdXXw1YG00lK3gpKyHYgGPV2LwsjyQSO7OlLsrg9CTfasFP7oSSeqNutBYShpB",
+
+
+# çalışıyorsa kapat
+pkill -f "run_futures.py" || true
+
+# başlat
+export FUTURE_TRADE_CONFIG=/opt/tradebot/future_trade/config.json
+python /opt/tradebot/run_futures.py

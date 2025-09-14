@@ -1,0 +1,108 @@
+{
+    "api": {
+        "binance": {
+            "api_key": "UvePQzRE6I0777UcGYmUgsqisejiIxeCSlKFG042gjrSvKGDxnv7fFauYT45WJrd",
+            "api_secret": "5oPdXXw1YG00lK3gpKyHYgGPV2LwsjyQSO7OlLsrg9CTfasFP7oSSeqNutBYShpB",
+            "testnet": false
+        }
+    },
+    "telegram": {
+        "log_bot": {
+            "token": "7179161717:AAEGcM8LCvvBtp5JJ6uToSM9dUSKDZvujM0",
+            "chat_id": "-1002248511924"
+        },
+        "trade_bot": {
+            "token": "7124471447:AAFqVmWSoPJ1QNKJ8Xs8xnoeXzAemW_jvjc",
+            "chat_id": "-1002060677583"
+        }
+    },
+
+    
+    "database": {
+        "path": "data/trading_data.db"
+    },
+    "global_database": {
+        "path": "/root/Botson/9_simsar/Dominance/simsar/Dominace_2/Devin_2/trading_data.db"
+    },
+
+
+
+    "trading": {
+    "volume_filter": 2000000,
+    "max_open_positions": 2,
+    "risk_ratio": 0.05,
+    "top_n": 10,
+    "leverage": {
+        "isolated": 5,
+        "cross": 4
+    },
+
+  "grid": {
+    "enabled": true,
+    "levels": [0.5, 1.0, 1.5, 2.0, 2.5],
+    "reduce_only": false
+  },
+
+  "stop_loss_buffer_pct": 0.005,
+  "take_profit_buffer_pct": 0.003,
+
+  "default_stop_loss_pct": 0.03,
+  "default_take_profit_pct": 0.05,
+
+  "stop_loss": {
+    "enabled": true,
+    "initial": -2.0,
+    "trailing_enabled": true,
+    "trailing_activation": 1.0,
+    "trailing_distance": 0.5,
+    "atr_multiplier": 2.0,
+    "min_profit_lock": 0.1,
+    "update_threshold": 0.5,
+    "partial_enabled": true,
+    "partial_stop_loss_points": [
+      {"percentage": -1.0, "size": 30.0},
+      {"percentage": -2.0, "size": 30.0},
+      {"percentage": -3.0, "size": 40.0}
+    ]
+  },
+
+  "take_profit": {
+    "enabled": true,
+    "mode": "partial",
+    "initial": 3.0,
+    "points": [
+      {"percentage": 1.5, "size": 40.0},
+      {"percentage": 3.0, "size": 30.0},
+      {"percentage": 5.0, "size": 30.0}
+        ]
+    }
+    },
+
+
+    "indicators": {
+    "atr_period": 14,
+    "ema_1h_period": 21,
+    "ema_4h_period": 20,
+    "min_ema_diff": 0.01,
+    "adx_period": 14,
+    "adx_threshold": 7,
+    "atr_threshold": 0.1,
+    "rsi_period": 14,
+    "rsi_up_threshold": 45,
+    "rsi_down_threshold": 55
+    },
+
+    "optimization": {
+        "population_size": 50,
+        "generations": 20,
+        "mutation_rate": 0.1,
+        "crossover_rate": 0.8,
+        "elite_size": 5
+    },
+    "logging": {
+        "level": "INFO",
+        "file_path": "logs/trading_bot.log",
+        "max_file_size": 10485760,
+        "backup_count": 5
+    }
+}
