@@ -184,7 +184,12 @@ class BinanceClient:
         if origClientOrderId: p["origClientOrderId"] = origClientOrderId
         return await self._signed("DELETE", "/fapi/v1/order", p)
 
-    
+    async def get_order(self, symbol: str, **kwargs) -> dict:
+        # kwargs: orderId=... veya origClientOrderId=...
+        p = {"symbol": symbol}
+        p.update(kwargs)
+        return await self._signed("GET", "/fapi/v1/order", p)
+
     
     async def all_orders(self, symbol: str, **kwargs) -> Dict[str, Any]:
         return await self._signed("GET", "/fapi/v1/allOrders", {"symbol": symbol, **kwargs})

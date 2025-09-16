@@ -9,7 +9,7 @@ from __future__ import annotations  # Tip ipuçları için (Python 3.7+ sonrası
 import time
 import math
 import logging
-
+import uuid
 # Tip tanımları
 from typing import Dict, Any
 
@@ -35,6 +35,31 @@ class OrderRouter:
                 self._exi_cache = {"symbols": []}
         return self._exi_cache
 
+    def _cid(self, prefix: str) -> str:
+        # 24h içinde benzersiz: ms timestamp + kısa uuid
+        return f"{prefix}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+
+    async def _place_idempotent(self, params: dict, stage: str) -> dict:
+        try:
+            return await self.client.place_order(**params)
+        except Exception as e:
+            resp = getattr(e, "response", None)
+            body = (resp.text or "") if resp is not None else ""
+            if "ClientOrderId is duplicated" in body or "-4116" in body:
+                # zaten aynı CID ile bir emir var → onu çek
+                try:
+                    od = await self.client.get_order(
+                        symbol=params["symbol"],
+                        origClientOrderId=params.get("newClientOrderId")
+                    )
+                    logging.info(f"idempotent-ok {stage} {params['symbol']} cid={params.get('newClientOrderId')} -> #{od.get('orderId')}")
+                    return od
+                except Exception as e2:
+                    logging.warning(f"idempotent-lookup-failed {stage}: {e2}; proceeding as placed")
+                    # En kötü ihtimalle devam (Router üst katmanda bir sonraki sync’te yakalar)
+                    return {"symbol": params["symbol"], "clientOrderId": params.get("newClientOrderId")}
+            raise
+
 
 
     async def place_entry_with_protection(self, plan):
@@ -53,18 +78,25 @@ class OrderRouter:
         exi = await self._exi()
         tick, step, min_notional = symbol_filters(exi, sym)
 
-        # qty kuantizasyon + minNotional kontrolü
         qty = max(quantize(float(plan.qty), step), step)
         entry_ref = float(plan.entry or 0.0)
-        if entry_ref <= 0.0:
-            # market fiyatını referans almak istersen burada ticker çağırıp doldurabilirsin.
-            # şimdilik qty*entry_ref kontrolünü atlıyoruz
-            pass
-        else:
+
+        # Marj uygunluğuna göre qty küçült
+        qty_pref = await self._cap_qty_by_margin(sym, qty, entry_ref, step)
+        if qty_pref < step:
+            await self.notifier.debug_trades({
+                "event": "sizing_rejected",
+                "symbol": sym,
+                "reason": "insufficient_margin",
+                "wanted_qty": qty, "capped_qty": qty_pref
+            })
+            raise Exception(f"Insufficient margin for {sym}: wanted {qty}, capped {qty_pref}")
+        qty = qty_pref
+
+        if entry_ref > 0.0:
             notional = qty * entry_ref
             if min_notional and notional < min_notional:
                 need_qty = min_notional / max(entry_ref, 1e-12)
-                # step'e yuvarla, en az 1 step
                 qty = max(quantize(need_qty, step), step)
 
         def qprice(p):
@@ -73,22 +105,32 @@ class OrderRouter:
         sl_price = qprice(getattr(plan, "sl", None))
         tp_price = qprice(getattr(plan, "tp", None))
 
-        # 2) Eski koruma emirlerini iptal et (çakışma olmasın)
+        # 2) Eski koruma emirlerini iptal et
         await self._cancel_existing_protections(sym)
 
-        # 3) MARKET entry
+        # 3) MARKET entry (idempotent)
         entry_params = {
             "symbol": sym,
             "side": side,
             "type": "MARKET",
             "quantity": qty,
-            "newClientOrderId": f"entry_{int(time.time()*1000)}",
+            "newClientOrderId": self._cid("entry"),
         }
         try:
-            od_entry = await self.client.place_order(**entry_params)
-            await self.notifier.debug_trades({"event": "entry_ack", "symbol": sym, "orderId": od_entry.get("orderId"), "qty": qty})
+            od_entry = await self._place_idempotent(entry_params, "entry")
+            await self.notifier.debug_trades({
+                "event": "entry_ack",
+                "symbol": sym,
+                "orderId": od_entry.get("orderId"),
+                "qty": qty
+            })
         except Exception as e:
-            await self.notifier.alert({"event": "order_error", "symbol": sym, "stage": "entry", "error": str(e)})
+            await self.notifier.alert({
+                "event": "order_error",
+                "symbol": sym,
+                "stage": "entry",
+                "error": str(e)
+            })
             raise
 
         # 4) STOP (SL) — reduceOnly + closePosition
@@ -98,16 +140,25 @@ class OrderRouter:
                 "side": opp,
                 "type": "STOP_MARKET",
                 "stopPrice": sl_price,
-                "closePosition": "true",                # string → binance 'true' bekler
-                
+                "closePosition": "true",
                 "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                "newClientOrderId": f"sl_{int(time.time()*1000)}",
+                "newClientOrderId": self._cid("sl"),
             }
             try:
-                od_sl = await self.client.place_order(**sl_params)
-                await self.notifier.debug_trades({"event": "sl_ack", "symbol": sym, "orderId": od_sl.get("orderId"), "stop": sl_price})
+                od_sl = await self._place_idempotent(sl_params, "stop")
+                await self.notifier.debug_trades({
+                    "event": "sl_ack",
+                    "symbol": sym,
+                    "orderId": od_sl.get("orderId"),
+                    "stop": sl_price
+                })
             except Exception as e:
-                await self.notifier.alert({"event": "order_error", "symbol": sym, "stage": "stop", "error": str(e)})
+                await self.notifier.alert({
+                    "event": "order_error",
+                    "symbol": sym,
+                    "stage": "stop",
+                    "error": str(e)
+                })
 
         # 5) TAKE PROFIT
         tp_mode = str(self.cfg.get("tp_mode", "MARKET")).upper()
@@ -118,24 +169,51 @@ class OrderRouter:
                     "side": opp,
                     "type": "TAKE_PROFIT_MARKET",
                     "stopPrice": tp_price,
-                    "closePosition": "true",            # Close-All
+                    "closePosition": "true",
                     "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                    "newClientOrderId": f"tp_{int(time.time()*1000)}",
+                    "newClientOrderId": self._cid("tp"),
                 }
                 try:
-                    od_tp = await self.client.place_order(**tp_params)
-                    await self.notifier.debug_trades({"event": "tp_ack", "symbol": sym, "orderId": od_tp.get("orderId"), "tp": tp_price})
+                    od_tp = await self._place_idempotent(tp_params, "take_profit")
+                    await self.notifier.debug_trades({
+                        "event": "tp_ack",
+                        "symbol": sym,
+                        "orderId": od_tp.get("orderId"),
+                        "tp": tp_price
+                    })
                 except Exception as e:
-                    await self.notifier.alert({"event": "order_error", "symbol": sym, "stage": "take_profit", "error": str(e)})
-            
-                
-            try:
-                od_tp = await self.client.place_order(**tp_params)
-                await self.notifier.debug_trades({"event": "tp_ack", "symbol": sym, "orderId": od_tp.get("orderId"), "tp": tp_price})
-            except Exception as e:
-                await self.notifier.alert({"event": "order_error", "symbol": sym, "stage": "take_profit", "error": str(e)})
+                    await self.notifier.alert({
+                        "event": "order_error",
+                        "symbol": sym,
+                        "stage": "take_profit",
+                        "error": str(e)
+                    })
 
-        # 6) (DB tarafı) — Reconciler borsadan okuyacağı için burada ek işlem zorunlu değil.
+    # 6) (DB tarafı) — Reconciler borsadan okuyacağı için burada ek işlem zorunlu değil.
+
+    async def _effective_leverage(self, symbol: str) -> int:
+        # config: leverage: { "default": 3, "ETHUSDT": 5, ... }
+        lev_cfg = self.cfg.get("leverage", {})
+        return int(lev_cfg.get(symbol, lev_cfg.get("default", 3)))
+
+    async def _cap_qty_by_margin(self, symbol: str, qty: float, entry_ref: float, step: float) -> float:
+        """
+        available USDT ve kaldıraç ile maks. alım gücünü hesapla,
+        adedi step’e yuvarlayıp geri döndür.
+        """
+        lev = await self._effective_leverage(symbol)
+        px  = entry_ref or await self.client.get_price(symbol)
+        avail = await self.client.get_available_usdt()
+        # güvenlik payı
+        safety = float(self.cfg.get("margin_safety", 0.95))
+        max_notional = avail * lev * safety
+        if px <= 0:
+            return qty
+        max_qty = max_notional / px
+        # step’e oturt
+        from .exchange_utils import quantize
+        capped = quantize(max_qty, step)
+        return min(qty, max(capped, step))
 
 
 
