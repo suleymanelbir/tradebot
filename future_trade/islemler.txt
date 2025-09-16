@@ -12,3 +12,26 @@ pkill -f "run_futures.py" || true
 # başlat
 export FUTURE_TRADE_CONFIG=/opt/tradebot/future_trade/config.json
 python /opt/tradebot/run_futures.py
+
+
+Operasyon: nasıl koşturacağız?
+
+Başlat:
+
+python /opt/tradebot/run_futures.py
+
+
+(ENV şart değil; varsayılan config yolunu zaten logta görüyorsun.)
+
+Durdur:
+
+Ctrl + C
+# veya
+pkill -f "run_futures.py" || true
+
+
+Aşağıdaki komutla bir Python dosyasındaki tekrar eden importları görebilirsin:
+
+bash
+grep "^from\|^import" your_file.py | sort | uniq -d
+Bu, dosyadaki tekrar eden import satırlarını listeler.

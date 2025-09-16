@@ -125,97 +125,6 @@ def analyze_write_attempt(symbol, live_price, table="global_close_4h"):
     return result
 
 
-def deep_table_analysis(cursor: sqlite3.Cursor, table: str) -> dict:
-    """
-    Belirtilen tablo için yapısal ve içeriksel analiz yapar.
-    10 temel başlıkta tabloyu değerlendirir.
-    """
-    try:
-        # 1. Sütun bilgileri
-        cursor.execute(f"PRAGMA table_info({table})")
-        columns_raw = cursor.fetchall()
-        columns = [{
-            "ad": col[1],
-            "tip": col[2],
-            "primary_key": bool(col[5]),
-            "not_null": bool(col[3]),
-            "default": col[4]
-        } for col in columns_raw]
-        column_names = [col["ad"] for col in columns]
-
-        # 2. Kayıt sayısı
-        cursor.execute(f"SELECT COUNT(*) FROM {table}")
-        record_count = cursor.fetchone()[0]
-
-        # 3. Zaman sütunu var mı?
-        timestamp_column = next((c for c in column_names if "timestamp" in c.lower()), None)
-
-        # 4. Veri sütunu var mı?
-        value_column = next((c for c in ["close", "price", "live_price", "value"] if c in column_names), None)
-
-        # 5. Sembol sütunu var mı?
-        symbol_column = next((c for c in column_names if "symbol" in c.lower()), None)
-
-        # 6. İlk ve son kayıt zamanı
-        first_timestamp = last_timestamp = None
-        if timestamp_column:
-            cursor.execute(f"SELECT MIN({timestamp_column}), MAX({timestamp_column}) FROM {table}")
-            result = cursor.fetchone()
-            first_timestamp, last_timestamp = result if result else (None, None)
-
-        # 7. Son kayıt edilen veri
-        last_value = None
-        if timestamp_column and value_column:
-            cursor.execute(f"""
-                SELECT {value_column}
-                FROM {table}
-                ORDER BY {timestamp_column} DESC
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            if result:
-                last_value = result[0]
-
-        # 8. Veri kalitesi: NULL sayısı
-        null_counts = {}
-        for col in column_names:
-            cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} IS NULL")
-            null_counts[col] = cursor.fetchone()[0]
-
-        # 9. Veri tipi tutarlılığı (örnek veri)
-        sample_data = {}
-        cursor.execute(f"SELECT * FROM {table} LIMIT 1")
-        row = cursor.fetchone()
-        if row:
-            sample_data = dict(zip(column_names, row))
-
-        # 10. İlişkili tablo tahmini (symbol üzerinden)
-        related_tables = []
-        if symbol_column:
-            cursor.execute(f"SELECT DISTINCT {symbol_column} FROM {table} LIMIT 5")
-            symbols = [row[0] for row in cursor.fetchall()]
-            related_tables = symbols
-
-        return {
-            "tablo": table,
-            "sütunlar": columns,
-            "kayıt_sayısı": record_count,
-            "zaman_sütunu": timestamp_column,
-            "veri_sütunu": value_column,
-            "sembol_sütunu": symbol_column,
-            "ilk_kayıt_zamanı": first_timestamp,
-            "son_kayıt_zamanı": last_timestamp,
-            "son_kayıt_değeri": last_value,
-            "null_sayısı": null_counts,
-            "örnek_kayıt": sample_data,
-            "ilişkili_varlıklar": related_tables
-        }
-
-    except Exception as e:
-        print(f"⚠️ deep_table_analysis hata: {e}")
-        return {"tablo": table, "hata": str(e)}
-
-
 def get_recent_data(cursor, table, days=30):
     since = datetime.now() - timedelta(days=days)
     # Veri sütunu adayları
@@ -313,163 +222,6 @@ def generate_signal(momentum, rsi):
     else:
         return "bekle"
 
-# 🔹 Anomali Tespiti
-def detect_anomalies(values):
-    anomalies = []
-    if not values or len(values) < 2:
-        return anomalies  # boş liste döner
-    for i in range(1, len(values)):
-        change = abs(values[i] - values[i-1])
-        if change > (statistics.mean(values) * 0.1):
-            anomalies.append({
-                "index": i,
-                "deger": values[i],
-                "degisim": round(change, 3)
-            })
-    return anomalies
-
-def analyze_table_structure(cursor: sqlite3.Cursor, table: str) -> dict:
-    """
-    Belirtilen tablo için yapısal analiz yapar:
-    - Sütun bilgileri
-    - Kayıt sayısı
-    - Veri ve zaman sütunlarının varlığı
-    - En son kayıt zamanı ve değeri
-
-    Args:
-        cursor (sqlite3.Cursor): Veritabanı imleci
-        table (str): Tablo adı
-
-    Returns:
-        dict: Yapısal analiz sonuçları
-    """
-    try:
-        # 🔍 Sütun bilgileri
-        cursor.execute(f"PRAGMA table_info({table})")
-        columns_raw = cursor.fetchall()
-        columns = [{
-            "ad": col[1],
-            "tip": col[2],
-            "primary_key": bool(col[5]),
-            "not_null": bool(col[3]),
-            "default": col[4]
-        } for col in columns_raw]
-
-        # 🔢 Kayıt sayısı
-        cursor.execute(f"SELECT COUNT(*) FROM {table}")
-        record_count = cursor.fetchone()[0]
-
-        # 🔎 Veri ve zaman sütunları
-        column_names = [col["ad"] for col in columns]
-        value_column = next((c for c in ["close", "price", "live_price", "value"] if c in column_names), None)
-        timestamp_column = "timestamp" if "timestamp" in column_names else None
-
-        # 🕒 En son kayıt zamanı ve veri
-        last_timestamp = None
-        last_value = None
-        if value_column and timestamp_column:
-            cursor.execute(f"""
-                SELECT {timestamp_column}, {value_column}
-                FROM {table}
-                ORDER BY {timestamp_column} DESC
-                LIMIT 1
-            """)
-            result = cursor.fetchone()
-            if result:
-                last_timestamp, last_value = result
-
-        return {
-            "tablo": table,
-            "sütunlar": columns,
-            "kayıt_sayısı": record_count,
-            "zaman_sütunu": timestamp_column is not None,
-            "veri_sütunu": value_column if value_column else None,
-            "son_kayıt_zamanı": last_timestamp,
-            "son_kayıt_değeri": last_value
-        }
-
-    except sqlite3.Error as e:
-        print(f"⚠️ analyze_table_structure hata: {e}")
-        return {
-            "tablo": table,
-            "hata": str(e)
-        }
-
-def analyze_table(cursor: sqlite3.Cursor, table: str) -> dict:
-    """
-    Belirtilen tablo için son 30 günlük veri üzerinden analiz yapar:
-    - Momentum
-    - RSI
-    - Sinyal üretimi
-    - Anomali tespiti
-
-    Args:
-        cursor (sqlite3.Cursor): Veritabanı imleci
-        table (str): Tablo adı
-
-    Returns:
-        dict: Analiz sonuçları
-    """
-    try:
-        data = get_recent_data(cursor, table, days=30)
-        if not data or len(data[0]) < 2:
-            return {
-                "tablo": table,
-                "uyarı": "analiz için uygun veri sütunu yok",
-                "momentum": None,
-                "rsi": None,
-                "sinyal": "belirsiz",
-                "anomaliler": [],
-                "son_kayit_sayisi": 0,
-                "son_kayit_zamani": None,
-                "n8n_trigger": {
-                    "alert_level": "normal",
-                    "action_required": False,
-                    "change_detected": False
-                }
-            }
-
-        timestamps = [row[0] for row in data]
-        closes = [row[1] for row in data if row[1] is not None]
-
-        momentum = compute_momentum(closes)
-        rsi = compute_rsi(closes)
-        signal = generate_signal(momentum, rsi)
-        anomalies = detect_anomalies(closes)
-
-        return {
-            "tablo": table,
-            "son_kayit_sayisi": len(data),
-            "momentum": momentum,
-            "rsi": rsi,
-            "sinyal": signal,
-            "anomaliler": anomalies,
-            "son_kayit_zamani": timestamps[-1] if timestamps else None,
-            "n8n_trigger": {
-                "alert_level": "critical" if signal != "bekle" else "normal",
-                "action_required": signal != "bekle",
-                "change_detected": len(anomalies) > 0
-            }
-        }
-
-    except Exception as e:
-        print(f"⚠️ analyze_table hata: {e}")
-        return {
-            "tablo": table,
-            "uyarı": f"analiz hatası: {str(e)}",
-            "momentum": None,
-            "rsi": None,
-            "sinyal": "belirsiz",
-            "anomaliler": [],
-            "son_kayit_sayisi": 0,
-            "son_kayit_zamani": None,
-            "n8n_trigger": {
-                "alert_level": "critical",
-                "action_required": True,
-                "change_detected": False
-            }
-        }
-
 
 # 🔹 JSON → CSV Dönüştürme
 def export_to_csv(json_data, filename="analiz_raporu.csv"):
@@ -562,12 +314,10 @@ def main():
 
     for table in tables:
         # 🔍 Önce yapısal ve içeriksel analiz (10 başlık)
-        detayli_analiz = deep_table_analysis(cursor, table)
+
 
         # ⛔ Veri sütunu veya zaman sütunu yoksa istatistiksel analiz atlanır
-        if detayli_analiz.get("veri_sütunu") and detayli_analiz.get("zaman_sütunu"):
-            istatistiksel_analiz = analyze_table(cursor, table)
-        else:
+        
             istatistiksel_analiz = {
                 "uyarı": "İstatistiksel analiz için uygun veri/zaman sütunu bulunamadı.",
                 "momentum": None,
@@ -583,11 +333,6 @@ def main():
                 }
             }
 
-        # 📦 Raporu tabloya ekle
-        rapor["tablolar"][table] = {
-            "yapı": detayli_analiz,
-            "istatistik": istatistiksel_analiz
-        }
 
     conn.close()
 

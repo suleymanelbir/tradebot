@@ -25,6 +25,37 @@ class BinanceClient:
         # Tek bir AsyncClient yeterli
         self._client = httpx.AsyncClient(base_url=base_url, timeout=20.0)
 
+    # Public price
+    async def get_price(self, symbol: str) -> float:
+        r = await self._client.get("/fapi/v1/ticker/price", params={"symbol": symbol})
+        r.raise_for_status()
+        data = r.json()
+        return float(data["price"])
+
+    # Account (futures)
+    async def get_account(self) -> dict:
+        return await self._signed("GET", "/fapi/v2/account", {})
+
+    async def get_available_usdt(self) -> float:
+        acc = await self.get_account()
+        # Bazı SDK'larda top-level "availableBalance" var; yoksa assets listesine bak
+        if "availableBalance" in acc:
+            try:
+                return float(acc["availableBalance"])
+            except Exception:
+                pass
+        for a in acc.get("assets", []):
+            if a.get("asset") == "USDT":
+                return float(a.get("availableBalance", 0))
+        return 0.0
+
+
+
+    async def get_position_side(self):
+        # true = HEDGE (dual), false = ONE_WAY
+        return await self._signed("GET", "/fapi/v1/positionSide/dual", {})
+
+
     async def get_exchange_info(self):
         r = await self._client.get("/fapi/v1/exchangeInfo")
         r.raise_for_status()
@@ -58,12 +89,24 @@ class BinanceClient:
 
     # ---------- Private (signed) ----------
     async def set_position_side_oneway(self):
+        # Pre-check: zaten ONE_WAY ise POST atmayalım
+        try:
+            cur = await self.get_position_side()
+            # Binance: {"dualSidePosition": true/false}
+            if not bool(cur.get("dualSidePosition", True)):
+                logging.info("positionSide already ONE_WAY")
+                return {"code": -4059, "msg": "No need to change"}
+        except Exception as e:
+            # GET başarısız olursa, yine de POST deneyebiliriz
+            logging.debug(f"positionSide GET failed, will POST: {e}")
+
+        # Gerekliyse ONE_WAY'e çek
         try:
             return await self._signed("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
         except Exception as e:
             resp = getattr(e, "response", None)
             body = (resp.text or "") if resp is not None else ""
-            if "-4059" in body:  # No need to change position side
+            if "-4059" in body:
                 logging.info("positionSide already ONE_WAY")
                 return {"code": -4059, "msg": "No need to change"}
             raise

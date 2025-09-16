@@ -4,24 +4,76 @@ SHORT: tersi; ADX>=20
 Not: Bu iskelette göstergesel değerler ctx['indices'] ve bar history'den gelecektir (TODO: gerçek hesap).
 """
 from typing import Dict, Any
-from .base import StrategyBase, Signal
 
+
+# /opt/tradebot/future_trade/strategy/dominance_trend.py
+from .base import StrategyBase, Signal
+from .indicators import ema, rsi, atr, adx
 
 class DominanceTrend(StrategyBase):
-    def on_bar(self, bar_event: Dict[str, Any], ctx: Dict[str, Any]) -> Signal:
-        symbol = bar_event["symbol"]
-        indices = ctx.get("indices", {})
-        # TODO: ctx'den gerekli 1H/4H EMA/RSI/ADX ve dominance verilerini oku/hesapla
-        # Placeholder karar mantığı:
-        ok_long = False
-        ok_short = False
-        adx_ok = True # TODO: hesapla
-        if adx_ok:
-        # Koşullar (placeholder)
-            ok_long = True # gerçek kuralları burada kontrol et
-        ok_short = False
-        if ok_long:
-            return Signal(side="LONG", strength=0.6)
-        if ok_short:
-            return Signal(side="SHORT", strength=0.6)
-        return Signal(side="FLAT", strength=0.0)
+    def on_bar(self, event: dict, ctx: dict) -> Signal:
+        # event: {"symbol","tf","bars": {"highs","lows","closes","t","last_close"}}
+        bars = event["bars"]
+        closes = bars["closes"]; highs = bars["highs"]; lows = bars["lows"]
+        if len(closes) < 50: 
+            return Signal(side="FLAT")
+
+        # İndeks snapshot
+        idx = ctx.get("indices", {})
+        t3_1h = idx.get("TOTAL3", {}).get("tf1h", {})
+        t3_4h = idx.get("TOTAL3", {}).get("tf4h", {})
+        usdt_1h = idx.get("USDT.D", {}).get("tf1h", {})
+        btc_1h = idx.get("BTC.D", {}).get("tf1h", {})
+
+        # Parametreler
+        p = self.cfg.get("params", {})
+        ema_p = int(p.get("ema_period", 20))
+        rsi_p = int(p.get("rsi_period", 14))
+        adx_p = int(p.get("adx_period", 14))
+        adx_min = float(p.get("adx_min", 20))
+        atr_p = int(p.get("atr_period", 14))
+        atr_mult_sl = float(p.get("atr_mult_sl", 2.0))
+        atr_mult_tp = float(p.get("atr_mult_tp", 3.0))
+
+        # Sembol 1H EMA
+        ema1h = ema(closes[-60:], ema_p)
+        last_close = closes[-2] if len(closes) >= 2 else closes[-1]  # son kapalı
+
+        # RSI/ATR/ADX
+        rsi1h = rsi(closes, rsi_p)
+        atr1h = atr(highs, lows, closes, atr_p)
+        adx1h = adx(highs, lows, closes, adx_p)
+
+        long_ok = (
+            t3_4h.get("close", 0) > t3_4h.get("ema20", 1e18) and
+            t3_1h.get("close", 0) > t3_1h.get("ema20", 1e18) and
+            last_close > ema1h and
+            rsi1h < 60.0 and
+            usdt_1h.get("close", 1e18) < usdt_1h.get("ema20", 0) and
+            btc_1h.get("close", 1e18) < btc_1h.get("ema20", 0) and
+            adx1h >= adx_min
+        )
+
+        short_ok = (
+            t3_4h.get("close", 0) < t3_4h.get("ema20", -1e18) and
+            t3_1h.get("close", 0) < t3_1h.get("ema20", -1e18) and
+            last_close < ema1h and
+            usdt_1h.get("close", -1e18) > usdt_1h.get("ema20", 0) and
+            btc_1h.get("close", -1e18) > btc_1h.get("ema20", 0) and
+            adx1h >= adx_min
+        )
+
+        if long_ok:
+            sl = last_close - atr_mult_sl * atr1h
+            tp = last_close + atr_mult_tp * atr1h
+            return Signal(side="LONG", entry=last_close, sl=sl, tp=tp)
+
+        if short_ok:
+            sl = last_close + atr_mult_sl * atr1h
+            tp = last_close - atr_mult_tp * atr1h
+            return Signal(side="SHORT", entry=last_close, sl=sl, tp=tp)
+
+        return Signal(side="FLAT")
+
+# registry (eğer yoksa)
+STRATEGY_REGISTRY = {"dominance_trend": DominanceTrend}
