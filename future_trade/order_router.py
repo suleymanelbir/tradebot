@@ -5,16 +5,20 @@
 # /opt/tradebot/future_trade/order_router.py
 from __future__ import annotations  # Tip ipuçları için (Python 3.7+ sonrası)
 
-# Standart kütüphaneler
+# 📦 Standart Kütüphaneler
 import time
 import math
 import logging
 import uuid
-# Tip tanımları
-from typing import Dict, Any
 
-# Proje içi modüller
+# 🧠 Tip Tanımları
+from typing import Dict, Any, List, Optional
+
+# 🛠️ Proje İçi Modüller
 from .exchange_utils import quantize, price_quantize, symbol_filters
+from .strategy.indicators import atr  # ATR hesaplamak için
+
+
 
 
 class OrderRouter:
@@ -216,6 +220,43 @@ class OrderRouter:
         return min(qty, max(capped, step))
 
 
+    def _cid(self, prefix: str) -> str:
+        return f"{prefix}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+
+    async def _exi(self):
+        if self._exi_cache is None:
+            try:
+                self._exi_cache = await self.client.get_exchange_info()
+                logging.info("exchangeInfo cached")
+            except Exception as e:
+                logging.warning(f"exchangeInfo fetch failed: {e}")
+                self._exi_cache = {"symbols": []}
+        return self._exi_cache
+
+    async def _current_sl_order(self, symbol: str) -> Optional[dict]:
+        """Açık STOP_MARKET close-all (closePosition=true) SL emrini bul."""
+        try:
+            opens = await self.client.open_orders(symbol)
+        except Exception as e:
+            logging.debug(f"open_orders fail {symbol}: {e}")
+            return None
+        for od in opens:
+            t = od.get("type")
+            cp = str(od.get("closePosition", "")).lower() == "true"
+            if t in ("STOP_MARKET", "STOP") and cp:
+                return od
+        return None
+
+    async def _cancel_order_silent(self, symbol: str, order_id: Optional[int]=None, client_id: Optional[str]=None):
+        try:
+            p = {"symbol": symbol}
+            if order_id: p["orderId"] = order_id
+            if client_id: p["origClientOrderId"] = client_id
+            await self.client.cancel_order(**p)
+        except Exception as e:
+            logging.debug(f"cancel_order_silent {symbol}: {e}")
+
+
 
     async def _cancel_existing_protections(self, symbol: str):
         """Sembole ait açık reduceOnly SL/TP emirlerini iptal et (çakışmayı önler)."""
@@ -235,4 +276,117 @@ class OrderRouter:
 
 
     async def update_trailing_for_open_positions(self, stream, trailing_cfg: Dict[str, Any]):
-        return  # placeholder; 401 çözülünce gerçek trailing SL'yi ekleyeceğiz
+        """
+        ATR tabanlı trailing:
+        - LONG: new_stop = close - atr_mult * ATR
+        - SHORT: new_stop = close + atr_mult * ATR
+        - Yalnızca 'önemli iyileşme' varsa günceller (step_pct eşiği)
+        - STOP_MARKET closePosition=true kullanır (quantity/reduceOnly gönderilmez)
+        """
+        # Trailing parametreleri
+        tf = stream.tf_entry
+        period = int(trailing_cfg.get("atr_period", 14))
+        mult = float(trailing_cfg.get("atr_mult", 2.0))
+        step_pct = float(trailing_cfg.get("step_pct", 0.1)) / 100.0
+
+        # DB'den açık pozisyonları çek
+        conn = self.persistence._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT symbol,
+                    qty,
+                    CASE WHEN qty >= 0 THEN 'LONG' ELSE 'SHORT' END AS side
+                FROM futures_positions
+                WHERE ABS(qty) > 0
+            """)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return
+
+        exi = await self._exi()
+
+        for sym, qty, side in rows:
+            try:
+                # Reality check: pozisyon yönü ile miktar işareti tutarlı mı?
+                if (side == "LONG" and qty < 0) or (side == "SHORT" and qty > 0):
+                    await self.notifier.alert({
+                        "event": "trailing_mismatch",
+                        "symbol": sym,
+                        "qty": qty,
+                        "side": side,
+                        "error": "Position direction mismatch"
+                    })
+                    continue
+
+                tick, step, _ = symbol_filters(exi, sym)
+
+                limit = max(period + 3, 25)
+                kl = await self.client.get_klines(sym, interval=tf, limit=limit)
+                if not kl or len(kl) < period + 1:
+                    continue
+
+                closes = [float(k[4]) for k in kl]
+                highs  = [float(k[2]) for k in kl]
+                lows   = [float(k[3]) for k in kl]
+
+                atr_val = atr(highs, lows, closes, period=period)
+                if not atr_val or math.isnan(atr_val):
+                    continue
+
+                last_close = closes[-1]
+
+                if side == "LONG":
+                    target = last_close - mult * atr_val
+                    opp = "SELL"
+                else:
+                    target = last_close + mult * atr_val
+                    opp = "BUY"
+
+                target_q = price_quantize(target, tick)
+
+                cur_sl = await self._current_sl_order(sym)
+                cur_stop = float(cur_sl["stopPrice"]) if cur_sl and cur_sl.get("stopPrice") else None
+
+                should_update = False
+                if cur_stop is None:
+                    should_update = True
+                else:
+                    if side == "LONG":
+                        should_update = target_q > cur_stop * (1.0 + step_pct)
+                    else:
+                        should_update = target_q < cur_stop * (1.0 - step_pct)
+
+                if not should_update:
+                    continue
+
+                if cur_sl:
+                    await self._cancel_order_silent(sym, order_id=cur_sl.get("orderId"))
+
+                sl_params = {
+                    "symbol": sym,
+                    "side": opp,
+                    "type": "STOP_MARKET",
+                    "stopPrice": target_q,
+                    "closePosition": "true",
+                    "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
+                    "newClientOrderId": self._cid("trail_sl"),
+                }
+                od = await self.client.place_order(**sl_params)
+                await self.notifier.debug_trades({
+                    "event": "trailing_updated",
+                    "symbol": sym,
+                    "side": side,
+                    "stop": target_q,
+                    "orderId": od.get("orderId"),
+                })
+
+            except Exception as e:
+                await self.notifier.alert({
+                    "event": "trailing_error",
+                    "symbol": sym,
+                    "error": str(e)
+                })

@@ -127,9 +127,14 @@ class BinanceClient:
         try:
             r.raise_for_status()
         except Exception:
-            logging.error("Binance response body: %s", r.text)
+            body = r.text or ""
+            if '"code":-4046' in body or '"code":-4059' in body:
+                logging.info(f"Binance response body: {body}")
+            else:
+                logging.error(f"Binance response body: {body}")
             raise
         return r.json()
+
 
 
 
