@@ -1,6 +1,19 @@
-yapılan işlemler ve açıklamalrı buraya yaılacak ve takip eilecek
-testnet: api: key":     "0c6040b0417201cc289f882b5e57c7b4454b4c5e5984659fc9c90a514718e8f8",
-            "secret":   "bde9e1e707d9e4a4c0e891301de3e5d29f73ace510479e2e141886698dd0a4a1",
+yapılan işlemler ve açıklamaları buraya yapılacak ve takip edilecek
+testnet: api: 
+https://testnet.binance.vision/key/generate
+
+
+HMAC-SHA-256 Key registered
+Save these values right now. They won't be shown ever again!
+
+API Key: pV6OZ79FGCAgCT7v4XlcZys9kcRewS2zs6eW3vU10kY2CkI8eNZbANYlV09KcROK
+
+Secret Key: gzS2XDpxmc4OTXk4MEJqOtjCG9PcZB42ONovyxG0y1UNL4LIPFoTyTe2ACdMRB3Y
+
+
+
+
+
 
 gerçek api:"key": "UvePQzRE6I0777UcGYmUgsqisejiIxeCSlKFG042gjrSvKGDxnv7fFauYT45WJrd",
 "secret": "5oPdXXw1YG00lK3gpKyHYgGPV2LwsjyQSO7OlLsrg9CTfasFP7oSSeqNutBYShpB",

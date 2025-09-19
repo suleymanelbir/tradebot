@@ -137,6 +137,9 @@ async def main() -> None:
     cfg = await load_config(cfg_file)
     logging.info("Config loaded OK")
 
+    
+
+
     # Notifier
     notifier = Notifier(cfg.get("telegram", {}))
     await notifier.info_trades({"event": "startup", "msg": "Futures bot starting"})
@@ -175,7 +178,7 @@ async def main() -> None:
 
     router = OrderRouter(client=client, cfg=router_cfg, notifier=notifier, persistence=persistence)
     reconciler = OrderReconciler(client=client, persistence=persistence, notifier=notifier)
-    supervisor = PositionSupervisor(cfg, portfolio, notifier)
+    supervisor = PositionSupervisor(cfg, portfolio, notifier, persistence)
 
     # Graceful shutdown
     stop = asyncio.Event()

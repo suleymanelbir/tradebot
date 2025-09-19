@@ -59,9 +59,60 @@ class Persistence:
     def init_schema(self):
         with self._conn() as c:
             cur = c.cursor()
+
+            # Mevcut şemayı kur (senin SCHEMA listenden)
             for stmt in SCHEMA:
                 cur.executescript(stmt)
+
+            # --- symbol_state tablosunu güvence altına al ---
+            # 1) tablo yoksa oluştur
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_state (
+                    symbol TEXT PRIMARY KEY,
+                    cooldown_until_ts INTEGER DEFAULT 0,
+                    last_exit_ts INTEGER DEFAULT 0
+                );
+            """)
+            # 2) varsa eksik kolonları ekle
+            cur.execute("PRAGMA table_info(symbol_state)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "cooldown_until_ts" not in cols:
+                cur.execute("ALTER TABLE symbol_state ADD COLUMN cooldown_until_ts INTEGER DEFAULT 0;")
+            if "last_exit_ts" not in cols:
+                cur.execute("ALTER TABLE symbol_state ADD COLUMN last_exit_ts INTEGER DEFAULT 0;")
+
             c.commit()
+
+    def set_cooldown(self, symbol: str, until_ts: int) -> None:
+        """Sembole cooldown sonunu (epoch) yazar/yeniler."""
+        with self._conn() as c:
+            c.execute("""
+                INSERT INTO symbol_state(symbol, cooldown_until_ts)
+                VALUES(?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET cooldown_until_ts=excluded.cooldown_until_ts
+            """, (symbol, int(until_ts)))
+            c.commit()
+
+    def get_cooldown(self, symbol: str) -> int:
+        """Sembol için cooldown sonu (epoch). Yoksa 0 döner."""
+        with self._conn() as c:
+            cur = c.execute("SELECT cooldown_until_ts FROM symbol_state WHERE symbol=?", (symbol,))
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def mark_exit_ts(self, symbol: str, ts: int) -> None:
+        """Son çıkış zamanını (epoch) kaydeder."""
+        with self._conn() as c:
+            c.execute("""
+                INSERT INTO symbol_state(symbol, last_exit_ts)
+                VALUES(?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET last_exit_ts=excluded.last_exit_ts
+            """, (symbol, int(ts)))
+            c.commit()
+
+        
+        
+        
     
     def record_signal_audit(self, event: Dict[str, Any], signal, decision: bool, reason: Optional[str] = None):
         with self._conn() as c:

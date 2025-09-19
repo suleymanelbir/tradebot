@@ -9,21 +9,36 @@ from typing import Dict, Any, Optional
 import httpx
 from urllib.parse import urlencode
 
-
 class BinanceClient:
-    def __init__(self, cfg: dict, mode: str):
+    
+    def __init__(self, cfg: dict, mode: str = "testnet"):
         self.mode = (mode or "testnet").lower()
+
+        # API key/secret
         self.key = cfg.get("key", "")
-        self.secret = cfg.get("secret", "")
-        self.recv = int(cfg.get("recv_window_ms", 5000))
+        self.secret = (cfg.get("secret", "") or "").encode()
 
+        # recvWindow (ms) -> self.recv
+        self.recv = int(cfg.get("recv_window_ms", 5000))   # <-- eksikti
+
+        # Base URL seçimleri (testnet/mainnet)
         if self.mode == "testnet":
-            base_url = cfg["testnet_base_url"]
+            self.base_url = cfg.get("testnet_base_url", "https://testnet.binancefuture.com")
+            self.ws_url   = cfg.get("testnet_ws_url",   "wss://stream.binancefuture.com")
         else:
-            base_url = cfg["base_url"]
+            self.base_url = cfg.get("base_url", "https://fapi.binance.com")
+            self.ws_url   = cfg.get("ws_url",   "wss://fstream.binance.com")
 
-        # Tek bir AsyncClient yeterli
-        self._client = httpx.AsyncClient(base_url=base_url, timeout=20.0)
+        # HTTP client -> self._client  (ve backward-compat için self.client)
+        timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=15.0)
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        self.client  = self._client  # bazı yerlerde client._client erişimi varsa yine de var
+
+        # Başlangıç log'u (hızlı teşhis için)
+        masked = f"{self.key[:4]}...{self.key[-4:]}" if self.key else "<empty>"
+        logging.info("[BINANCE] mode=%s base_url=%s key=%s recvWindow=%s",
+                    self.mode, self.base_url, masked, self.recv)
+
 
     # Public price
     async def get_price(self, symbol: str) -> float:
@@ -80,9 +95,26 @@ class BinanceClient:
         r.raise_for_status()
         return r.json()
 
-    async def set_leverage(self, symbol: str, leverage: int):
-        return await self._signed("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+    async def _public(self, method: str, path: str, params: dict | None = None) -> dict:
+        r = await self._client.request(method, path, params=params or {})
+        if r.status_code >= 400:
+            logging.error("Binance PUBLIC response body: %s", r.text)
+        r.raise_for_status()
+        return r.json()
 
+
+    async def set_leverage(self, symbol: str, leverage: int):
+        return await self._signed("POST", "/fapi/v1/leverage",
+                                  {"symbol": symbol, "leverage": int(leverage)})
+        
+    async def new_order(self, **kwargs):
+        # kwargs -> symbol, side, type, quantity/stopPrice/closePosition/... vb.
+        return await self._signed("POST", "/fapi/v1/order", kwargs)    
+    
+    async def order_test(self, **kwargs):
+        return await self._signed("POST", "/fapi/v1/order/test", kwargs)
+    
+    
     async def place_order(self, **params):
         # USDT-M Futures order endp.
         return await self._signed("POST", "/fapi/v1/order", params)
@@ -112,27 +144,22 @@ class BinanceClient:
             raise
 
 
-    async def _signed(self, method: str, path: str, params: dict):
-        """Binance USDT-M Futures imzalı istek (HMAC-SHA256 over urlencode(params))."""
+    async def _signed(self, method: str, path: str, params: dict | None) -> dict:
         ts = int(time.time() * 1000)
-        p = dict(params or {})
-        p.update({"timestamp": ts, "recvWindow": self.recv})
+        params = dict(params or {})
+        params.update({"timestamp": ts, "recvWindow": self.recv})
 
-        query = urlencode(p, doseq=True)
-        signature = hmac.new(self.secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        # Query string ve signature
+        qs  = urlencode(params, doseq=True)
+        sig = hmac.new(self.secret, qs.encode(), hashlib.sha256).hexdigest()
+
+        url = f"{path}?{qs}&signature={sig}"
         headers = {"X-MBX-APIKEY": self.key}
-        url = f"{path}?{query}&signature={signature}"
 
-        r = await self._client.request(method.upper(), url, headers=headers)
-        try:
-            r.raise_for_status()
-        except Exception:
-            body = r.text or ""
-            if '"code":-4046' in body or '"code":-4059' in body:
-                logging.info(f"Binance response body: {body}")
-            else:
-                logging.error(f"Binance response body: {body}")
-            raise
+        r = await self._client.request(method, url, headers=headers)
+        if r.status_code >= 400:
+            logging.error("Binance response body: %s", r.text)
+        r.raise_for_status()
         return r.json()
 
 
@@ -156,9 +183,19 @@ class BinanceClient:
             except Exception as e:
                 logging.warning(f"bootstrap warn {sym}: {e}")
 
+    async def _public(self, method: str, path: str, params: dict | None = None) -> dict:
+        r = await self._client.request(method, path, params=params or {})
+        if r.status_code >= 400:
+            logging.error("Binance PUBLIC response body: %s", r.text)
+        r.raise_for_status()
+        return r.json()
 
     async def exchange_info(self) -> Dict[str, Any]:
         r = await self._client.get("/fapi/v1/exchangeInfo"); r.raise_for_status(); return r.json()
+
+    async def klines(self, symbol: str, interval: str, limit: int = 500):
+        return await self._public("GET", "/fapi/v1/klines",
+                                  {"symbol": symbol, "interval": interval, "limit": limit})
 
 
     async def account_balance(self) -> Dict[str, Any]:
@@ -173,6 +210,11 @@ class BinanceClient:
         if symbol: p["symbol"] = symbol
         # v2 daha yaygın kullanılıyor
         return await self._signed("GET", "/fapi/v2/positionRisk", p)
+
+    async def set_position_side(self, dual_side: bool):
+        # dual_side True -> HEDGE; False -> ONE_WAY
+        return await self._signed("POST", "/fapi/v1/positionSide/dual",
+                                  {"dualSidePosition": str(dual_side).lower()})
 
 
     async def open_orders(self, symbol: str):
@@ -201,4 +243,7 @@ class BinanceClient:
 
 
     async def close(self):
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass

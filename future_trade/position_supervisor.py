@@ -1,37 +1,55 @@
 """Giriş kabul/ret; kapasite ve sembol kotaları; cooldown
 """
+import time
 from typing import Tuple
 
 
 # position_supervisor.py
+
 class PositionSupervisor:
-    def __init__(self, cfg, portfolio, notifier):
+    def __init__(self, cfg, portfolio, notifier, persistence):
         self.cfg = cfg
         self.portfolio = portfolio
         self.notifier = notifier
+        self.persistence = persistence
 
     def evaluate_entry(self, symbol, signal) -> Tuple[bool, str]:
+        # 1) FLAT ise asla girme
         if signal.side == "FLAT":
             return False, "flat"
 
+        # 2) Whitelist kontrolü
         whitelist = set(self.cfg.get("symbols_whitelist", []))
         if symbol not in whitelist:
             return False, "not_in_whitelist"
 
+        # 3) Cooldown kontrolü (dinamik veya statik her durumda buradan okunur)
+        try:
+            cd_until = int(self.persistence.get_cooldown(symbol))
+        except Exception:
+            cd_until = 0
+        if cd_until and int(time.time()) < cd_until:
+            return False, "cooldown"
+
+        # 4) Per-symbol limit (allow_multiple_entries)
         max_per_symbol = int(self.cfg.get("max_trades_per_symbol", 1))
+        allow_multi = bool(self.cfg.get("allow_multiple_entries", False))
 
-        # Mevcut pozisyonlar
-        positions = self.portfolio.open_positions()
+        positions = self.portfolio.open_positions()  # p.symbol, p.side, p.qty alanları olduğunu varsayıyoruz
         total_open = len(positions)
-        long_count  = sum(1 for p in positions if p.side == "LONG")
-        short_count = sum(1 for p in positions if p.side == "SHORT")
+        long_count  = sum(1 for p in positions if p.side == "LONG"  and abs(float(getattr(p, "qty", 0))) > 0)
+        short_count = sum(1 for p in positions if p.side == "SHORT" and abs(float(getattr(p, "qty", 0))) > 0)
 
-        # Sembol başı kota (>=1 desteklenir)
-        symbol_open = sum(1 for p in positions if p.symbol == symbol)
-        if symbol_open >= max_per_symbol:
-            return False, "max_symbol_limit_reached"
+        symbol_open = sum(1 for p in positions if p.symbol == symbol and abs(float(getattr(p, "qty", 0))) > 0)
 
-        # Global ve yön bazlı limitler
+        if not allow_multi:
+            if symbol_open > 0:
+                return False, "position_already_open"
+        else:
+            if symbol_open >= max_per_symbol:
+                return False, "max_symbol_limit_reached"
+
+        # 5) Global ve yön bazlı limitler
         max_global = int(self.cfg.get("max_open_trades_global", 4))
         max_longs  = int(self.cfg.get("max_long_trades", 3))
         max_shorts = int(self.cfg.get("max_short_trades", 3))
@@ -43,4 +61,5 @@ class PositionSupervisor:
         if signal.side == "SHORT" and short_count >= max_shorts:
             return False, "max_short_limit_reached"
 
+        # Tüm kontroller geçti
         return True, "ok"

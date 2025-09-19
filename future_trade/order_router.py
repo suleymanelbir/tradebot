@@ -10,6 +10,7 @@ import time
 import math
 import logging
 import uuid
+import httpx
 
 # 🧠 Tip Tanımları
 from typing import Dict, Any, List, Optional
@@ -283,13 +284,11 @@ class OrderRouter:
         - Yalnızca 'önemli iyileşme' varsa günceller (step_pct eşiği)
         - STOP_MARKET closePosition=true kullanır (quantity/reduceOnly gönderilmez)
         """
-        # Trailing parametreleri
         tf = stream.tf_entry
         period = int(trailing_cfg.get("atr_period", 14))
         mult = float(trailing_cfg.get("atr_mult", 2.0))
         step_pct = float(trailing_cfg.get("step_pct", 0.1)) / 100.0
 
-        # DB'den açık pozisyonları çek
         conn = self.persistence._conn()
         try:
             cur = conn.cursor()
@@ -311,7 +310,6 @@ class OrderRouter:
 
         for sym, qty, side in rows:
             try:
-                # Reality check: pozisyon yönü ile miktar işareti tutarlı mı?
                 if (side == "LONG" and qty < 0) or (side == "SHORT" and qty > 0):
                     await self.notifier.alert({
                         "event": "trailing_mismatch",
@@ -375,14 +373,32 @@ class OrderRouter:
                     "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
                     "newClientOrderId": self._cid("trail_sl"),
                 }
-                od = await self.client.place_order(**sl_params)
-                await self.notifier.debug_trades({
-                    "event": "trailing_updated",
-                    "symbol": sym,
-                    "side": side,
-                    "stop": target_q,
-                    "orderId": od.get("orderId"),
-                })
+
+                try:
+                    od = await self.client.place_order(**sl_params)
+                    await self.notifier.debug_trades({
+                        "event": "trailing_updated",
+                        "symbol": sym,
+                        "side": side,
+                        "stop": target_q,
+                        "orderId": od.get("orderId"),
+                    })
+                except httpx.HTTPStatusError as e:
+                    body = e.response.text if e.response else ""
+                    await self.notifier.trade({
+                        "event": "trailing_error",
+                        "symbol": sym,
+                        "status": getattr(e.response, "status_code", None),
+                        "binance": body
+                    })
+                    raise
+                except Exception as e:
+                    await self.notifier.trade({
+                        "event": "trailing_error",
+                        "symbol": sym,
+                        "error": str(e)
+                    })
+                    raise
 
             except Exception as e:
                 await self.notifier.alert({
