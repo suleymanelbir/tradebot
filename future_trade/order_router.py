@@ -30,15 +30,17 @@ class OrderRouter:
         self.persistence = persistence
         self._exi_cache = None
         
-    async def _exi(self):
-        if self._exi_cache is None:
-            try:
-                self._exi_cache = await self.client.get_exchange_info()
-                logging.info("exchangeInfo cached")
-            except Exception as e:
-                logging.warning(f"exchangeInfo fetch failed: {e}")
-                self._exi_cache = {"symbols": []}
-        return self._exi_cache
+        async def _exi(self):
+            if self._exi_cache is None:
+                try:
+                    # İSİM BİRLİĞİ: binance_client.exchange_info()
+                    self._exi_cache = await self.client.exchange_info()
+                    logging.info("exchangeInfo cached")
+                except Exception as e:
+                    logging.warning(f"exchangeInfo fetch failed: {e}")
+                    self._exi_cache = {"symbols": []}
+            return self._exi_cache
+
 
     def _cid(self, prefix: str) -> str:
         # 24h içinde benzersiz: ms timestamp + kısa uuid

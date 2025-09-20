@@ -1,12 +1,22 @@
+# /opt/tradebot/future_trade/order_reconciler.py
 """Emir ve pozisyon durum uzlaştırma
 - Periyodik olarak borsa ile DB durumunu hizalar
-- Kaybolan/çakışan emirleri temizler
+- Kaybolan/çakışan emirleri temizler, cooldown set eder
 """
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 import asyncio, logging, time
-from .cooldown import compute_dynamic_cooldown_sec, TF_SECONDS
-import time
+import sqlite3
+
+# Dinamik cooldown için güvenli import + fallback
+try:
+    from .cooldown import compute_dynamic_cooldown_sec, TF_SECONDS
+except Exception:
+    TF_SECONDS = {"1m":60, "5m":300, "15m":900, "1h":3600, "4h":14400, "1d":86400}
+    async def compute_dynamic_cooldown_sec(cfg, client, persistence, symbol, entry_tf: str) -> int:
+        bars = int(cfg.get("cooldown_bars_after_exit", 0))
+        tf_sec = TF_SECONDS.get(str(entry_tf).lower(), 3600)
+        return max(0, bars * tf_sec)
 
 class OrderReconciler:
     def __init__(self, client, persistence, notifier, cfg: Optional[Dict[str, Any]] = None):
@@ -14,121 +24,159 @@ class OrderReconciler:
         self.persistence = persistence
         self.notifier = notifier
         self.cfg = cfg or {}
-        
-    async def run(self):
-        poll_sec = int(self.cfg.get("reconciler", {}).get("poll_interval_sec", 5))
-        entry_tf = str(self.cfg.get("strategy", {}).get("timeframe_entry", "1h")).lower()
 
+    # ---------- low-level helpers (DB erişimi) ----------
+    def _conn(self):
+        return self.persistence._conn()
+
+    def _db_get_position(self, symbol: str) -> Optional[Tuple[str, float, float, int]]:
+        """futures_positions tablosundan (symbol, qty, entry_price, leverage) döner."""
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT symbol, qty, entry_price, leverage FROM futures_positions WHERE symbol=?", (symbol,))
+            row = cur.fetchone()
+        return row
+
+    def _db_upsert_position(self, symbol: str, side: str, qty: float, entry: float, lev: int):
+        now = int(time.time())
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
+                VALUES(?,?,?,?,?,0,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  side=excluded.side, qty=excluded.qty, entry_price=excluded.entry_price,
+                  leverage=excluded.leverage, updated_at=excluded.updated_at
+            """, (symbol, side, qty, entry, lev, now))
+            conn.commit()
+
+    def _db_clear_position(self, symbol: str):
+        now = int(time.time())
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE futures_positions
+                SET qty=0, unrealized_pnl=0, updated_at=?
+                WHERE symbol=?
+            """, (now, symbol))
+            conn.commit()
+
+    def _set_cooldown(self, symbol: str, until_ts: int):
+        now = int(time.time())
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO symbol_state(symbol, state, cooldown_until, updated_at)
+                VALUES(?, 'cooldown', ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  state='cooldown', cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
+            """, (symbol, until_ts, now))
+            conn.commit()
+
+    def _mark_exit_ts(self, symbol: str, ts: Optional[int] = None):
+        ts = ts or int(time.time())
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO symbol_state(symbol, last_signal_ts, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  last_signal_ts=excluded.last_signal_ts, updated_at=excluded.updated_at
+            """, (symbol, ts, ts))
+            conn.commit()
+
+    # ---------- borsa okuma ----------
+    async def _fetch_position_risk(self) -> List[Dict[str, Any]]:
+        """client.position_risk() / client.positions() uyumlu çağrı sargısı."""
+        if hasattr(self.client, "position_risk"):
+            return await self.client.position_risk()
+        if hasattr(self.client, "positions"):
+            return await self.client.positions()
+        return []
+
+    # ---------- tek geçiş ----------
+    async def _one_pass(self, entry_tf: str) -> None:
+        # 1) Borsadan pozisyonlar
+        ex = await self._fetch_position_risk()
+        # ex_pos: {'SOLUSDT': {'qty': -15.0, 'entry': 232.66, 'lev': 3}, ...}
+        ex_pos: Dict[str, Dict[str, float]] = {}
+        for p in ex or []:
+            sym = p.get("symbol")
+            if not sym:
+                continue
+            amt = float(p.get("positionAmt") or 0.0)
+            entry = float(p.get("entryPrice") or 0.0)
+            lev = int(float(p.get("leverage") or 0) or 1)
+            ex_pos[sym] = {"qty": amt, "entry": entry, "lev": lev}
+
+        # 2) DB pozisyonları
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT symbol, qty FROM futures_positions")
+            rows = cur.fetchall()
+        db_pos = {r[0]: float(r[1]) for r in rows}
+
+        symbols = set(ex_pos.keys()) | set(db_pos.keys())
+        now = int(time.time())
+
+        for sym in symbols:
+            db_qty = float(db_pos.get(sym, 0.0))
+            ex_qty = float(ex_pos.get(sym, {}).get("qty", 0.0))
+
+            # --- A) Borsa 0, DB ≠ 0 ⇒ Pozisyon kapanmış kabul et
+            if abs(ex_qty) < 1e-12 and abs(db_qty) > 1e-12:
+                try:
+                    self._db_clear_position(sym)
+                    self._mark_exit_ts(sym, now)
+                    # Dinamik cooldown hesapla
+                    cool = await compute_dynamic_cooldown_sec(self.cfg, self.client, self.persistence, sym, entry_tf)
+                    self._set_cooldown(sym, now + int(cool))
+                    await self.notifier.debug_trades({
+                        "event": "reconcile_close_sync",
+                        "symbol": sym, "db_qty": db_qty, "ex_qty": ex_qty,
+                        "cooldown_sec": int(cool)
+                    })
+                except Exception as e:
+                    await self.notifier.alert({"event": "reconcile_error", "symbol": sym, "stage": "close_sync", "error": str(e)})
+
+            # --- B) Borsa ≠ 0, DB 0 ⇒ Dışarıda açılmış / restore et
+            elif abs(ex_qty) > 1e-12 and abs(db_qty) < 1e-12:
+                side = "LONG" if ex_qty > 0 else "SHORT"
+                try:
+                    self._db_upsert_position(sym, side, ex_qty, ex_pos[sym]["entry"], int(ex_pos[sym]["lev"]))
+                    await self.notifier.debug_trades({
+                        "event": "reconcile_restore",
+                        "symbol": sym, "qty": ex_qty, "entry": ex_pos[sym]["entry"], "lev": ex_pos[sym]["lev"]
+                    })
+                except Exception as e:
+                    await self.notifier.alert({"event": "reconcile_error", "symbol": sym, "stage": "restore_sync", "error": str(e)})
+
+            # --- C) İkisi de ≠ 0 ama farklı ⇒ DB’yi borsaya hizala
+            elif abs(ex_qty - db_qty) > 1e-12:
+                side = "LONG" if ex_qty > 0 else "SHORT"
+                try:
+                    self._db_upsert_position(sym, side, ex_qty, ex_pos[sym]["entry"], int(ex_pos[sym]["lev"]))
+                    await self.notifier.debug_trades({
+                        "event": "reconcile_adjust",
+                        "symbol": sym, "from": db_qty, "to": ex_qty
+                    })
+                except Exception as e:
+                    await self.notifier.alert({"event": "reconcile_error", "symbol": sym, "stage": "adjust_sync", "error": str(e)})
+
+            # else: tamamen uyumlu → no-op
+
+    # ---------- dış API ----------
+    async def run(self):
+        entry_tf = str(self.cfg.get("timeframe_entry") or self.cfg.get("strategy", {}).get("timeframe_entry") or "1h")
+        poll_sec = int(self.cfg.get("reconcile_interval_sec", 5))
+        backoff = 1
         while True:
             try:
-                # 1) EXCHANGE pozisyonları çek
-                ex = await self.client.position_risk()  # /fapi/v2/positionRisk
-                # ex_pos: {'SOLUSDT': -15.0, 'BTCUSDT': 0.0, ...}
-                ex_pos = {}
-                for p in ex:
-                    sym = p.get("symbol"); amt = float(p.get("positionAmt", 0) or 0)
-                    ex_pos[sym] = amt
-
-                # 2) DB pozisyonlarını çek
-                conn = self.persistence._conn()
-                cur = conn.cursor()
-                cur.execute("SELECT symbol, qty FROM futures_positions")
-                db_rows = cur.fetchall()
-                conn.close()
-                db_pos = {r[0]: float(r[1]) for r in db_rows}
-
-                # 3) Birlikte ele al
-                symbols = set(ex_pos.keys()) | set(db_pos.keys())
-                for sym in symbols:
-                    db_qty = float(db_pos.get(sym, 0.0))
-                    ex_qty = float(ex_pos.get(sym, 0.0))
-
-                    # --- (A) POZİSYON KAPANDI: DB'de açık görünüyor ama borsada 0
-                    if abs(db_qty) > 0 and abs(ex_qty) == 0:
-                        # DB kapat (senin mevcut kapatma kodun burada olmalı)
-                        conn = self.persistence._conn()
-                        try:
-                            c2 = conn.cursor()
-                            # ör: qty=0'a çekiyoruz (veya satırı siliyorsan delete)
-                            c2.execute("UPDATE futures_positions SET qty=0, unrealized_pnl=0 WHERE symbol=?", (sym,))
-                            conn.commit()
-                        finally:
-                            conn.close()
-
-                        # ==> TAM OLARAK BURADA Dinamik Cooldown Hesapla & Yaz
-                        try:
-                            sec = await compute_dynamic_cooldown_sec(self.cfg, self.client, self.persistence, sym, entry_tf)
-                        except Exception:
-                            # fallback: static bar-bazlı cooldown (opsiyonel)
-                            bars = int(self.cfg.get("cooldown_bars_after_exit", 0))
-                            tf_sec = TF_SECONDS.get(entry_tf, 3600)
-                            sec = max(0, bars * tf_sec)
-
-                        exit_ts = int(time.time())
-                        until_ts = exit_ts + int(sec)
-
-                        # DB state güncelle
-                        self.persistence.mark_exit_ts(sym, exit_ts)
-                        self.persistence.set_cooldown(sym, until_ts)
-
-                        # Bilgilendirme (Telegram debug)
-                        try:
-                            await self.notifier.debug_trades({
-                                "event": "cooldown_set",
-                                "symbol": sym,
-                                "seconds": int(sec),
-                                "until_ts": until_ts
-                            })
-                        except Exception:
-                            pass
-
-                    # --- (B) POZİSYON AÇILDI: DB 0 ama borsada != 0 (opsiyonel senkron)
-                    elif abs(db_qty) == 0 and abs(ex_qty) > 0:
-                        # DB'ye yaz (örnek)
-                        side = "LONG" if ex_qty > 0 else "SHORT"
-                        conn = self.persistence._conn()
-                        try:
-                            c2 = conn.cursor()
-                            c2.execute("""
-                                INSERT OR REPLACE INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
-                                VALUES(?, ?, ?, COALESCE(entry_price, 0), COALESCE(leverage, 1), 0, ?)
-                            """, (sym, side, ex_qty, int(time.time())))
-                            conn.commit()
-                        finally:
-                            conn.close()
-
-                    # --- (C) İKİ TARAF TA 0 (flat) → yapılacak yok
-                    else:
-                        pass
-
+                await self._one_pass(entry_tf)
+                backoff = 1
             except Exception as e:
                 logging.warning(f"reconciler loop error: {e}")
-
-            await asyncio.sleep(poll_sec)
-
-
-    async def _tick(self):
-        pr = await self.client.position_risk()  # v2
-        conn = self.persistence._conn()
-        try:
-            cur = conn.cursor()
-            seen = set()
-            for p in pr:
-                sym = p["symbol"]
-                seen.add(sym)
-                pos_amt = float(p.get("positionAmt") or 0.0)
-                entry = float(p.get("entryPrice") or 0.0)
-                if abs(pos_amt) < 1e-12:
-                    # borsada pozisyon yok → DB’den sil
-                    cur.execute("DELETE FROM futures_positions WHERE symbol=?", (sym,))
-                    logging.debug(f"reconciler: cleared {sym} (no position on exchange)")
-                else:
-                    side = "LONG" if pos_amt > 0 else "SHORT"
-                    cur.execute("""INSERT OR REPLACE INTO futures_positions
-                                   (symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
-                                   VALUES (?, ?, ?, ?, ?, 0, ?)""",
-                                (sym, side, pos_amt, entry, 1, int(time.time())))
-                    logging.debug(f"reconciler: upsert {sym} side={side} qty={pos_amt}")
-            conn.commit()
-        finally:
-            conn.close()
+                await self.notifier.alert({"event": "reconcile_loop_error", "error": str(e)})
+                # basit backoff
+                backoff = min(backoff * 2, 60)
+            await asyncio.sleep(max(poll_sec, backoff))

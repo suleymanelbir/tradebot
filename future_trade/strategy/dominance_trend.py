@@ -5,14 +5,20 @@ Not: Bu iskelette göstergesel değerler ctx['indices'] ve bar history'den gelec
 """
 from typing import Dict, Any
 
-
 # /opt/tradebot/future_trade/strategy/dominance_trend.py
 from .base import StrategyBase, Signal
 from .indicators import ema, rsi, atr, adx
 
 class DominanceTrend(StrategyBase):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        self.smoke = bool(cfg.get("smoke", False))  # config’den alınır
+
     def on_bar(self, event: dict, ctx: dict) -> Signal:
-        # event: {"symbol","tf","bars": {"highs","lows","closes","t","last_close"}}
+        if self.smoke:
+            # Smoke test modu: sabit LONG sinyali döner
+            return Signal(side="LONG", strength=0.6)
+
         bars = event["bars"]
         closes = bars["closes"]; highs = bars["highs"]; lows = bars["lows"]
         if len(closes) < 50: 
@@ -37,7 +43,7 @@ class DominanceTrend(StrategyBase):
 
         # Sembol 1H EMA
         ema1h = ema(closes[-60:], ema_p)
-        last_close = closes[-2] if len(closes) >= 2 else closes[-1]  # son kapalı
+        last_close = closes[-2] if len(closes) >= 2 else closes[-1]
 
         # RSI/ATR/ADX
         rsi1h = rsi(closes, rsi_p)
