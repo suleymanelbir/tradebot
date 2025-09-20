@@ -9,7 +9,7 @@ from __future__ import annotations  # Gelecekteki tip ipuçları için (Python 3
 import asyncio
 import logging
 import sqlite3
-
+import time
 # Tip tanımları
 from typing import Dict, Any, List, AsyncGenerator, TYPE_CHECKING
 
@@ -48,6 +48,7 @@ class MarketStream:
         self.client = client                     # <<< ÖNEMLİ: sınıf alanı
         self._q: asyncio.Queue = asyncio.Queue() # event kuyruğu
         self._indices_cache: Dict[str, Any] = {} # TOTAL3/USDT.D/BTC.D snapshot
+        self._last_prices: Dict[str, float] = {}
         self.global_db = self.cfg.get("global_db_path", "/opt/tradebot/veritabani/global_data.db")
 
 
@@ -129,6 +130,14 @@ class MarketStream:
             except Exception:
                 pass
 
+    def get_last_price(self, symbol: str):
+        return self._last_prices.get(symbol)
+
+    def _mock_price(self, sym: str, now: int) -> float:
+        # çok basit bir salınım: 100 etrafında +/- 5
+        import math
+        base = 100.0
+        return base + 5.0 * math.sin(now / 60.0)  # ~1 dakikada bir salınsın
 
 
 
@@ -136,20 +145,52 @@ class MarketStream:
         poll_sec = 60
         while True:
             try:
+                # Paper test modu aktifse sentetik veri üret
+                if getattr(self.cfg, "force_paper_stream", False):
+                    now = int(time.time())
+                    for sym in self.whitelist:
+                        price = self._mock_price(sym, now)
+                        event = {
+                            "type": "bar_closed",
+                            "symbol": sym,
+                            "tf": self.tf_entry,
+                            "close": price,
+                            "time": now
+                        }
+                        self._last_prices[sym] = price
+                        await self._q.put(event)
+                    # İndeks güncellemesi hâlâ yapılabilir
+                    self._refresh_indices()
+                    await asyncio.sleep(poll_sec)
+                    continue
+
+                # Gerçek veri akışı (Binance Kline)
                 self._refresh_indices()  # <<< artık var
                 for sym in self.whitelist:
                     try:
                         bars = await self._fetch_1h_bars(sym, limit=150)
+
+                        # 1) Gerçek bar_closed eventi
                         ev = {"type": "bar_closed", "symbol": sym, "tf": "1h", "bars": bars}
                         await self._q.put(ev)
+
+                        # 2) Sentetik bar_closed (örnekleme amaçlı)
+                        now = int(time.time())
+                        event = {
+                            "type": "bar_closed",
+                            "symbol": sym,
+                            "tf": self.tf_entry,
+                            "close": 100.0,
+                            "time": now
+                        }
+                        self._last_prices[sym] = event["close"]
+                        await self._q.put(event)
+
                     except Exception as se:
                         logging.warning(f"kline fetch failed for {sym}: {se}")
             except Exception as e:
                 logging.error(f"stream error: {e}")
             await asyncio.sleep(poll_sec)
-
-
-
 
 
     async def events(self) -> AsyncGenerator[Dict[str, Any], None]:

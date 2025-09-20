@@ -7,6 +7,7 @@ import os
 import signal
 import contextlib
 import json
+import aiohttp
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -122,63 +123,118 @@ async def trailing_loop(
             await notifier.alert({"event": "trailing_error", "error": str(e)})
         await asyncio.sleep(interval)
 
+async def send_alert(msg: str):
+    import aiohttp
+    token = "7179161717:AAEGcM8LCvvBtp5JJ6uToSM9dUSKDZvujM0"
+    chat_id = "-1002248511924"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(url, data={"chat_id": chat_id, "text": msg})
+        except Exception as e:
+            logging.error(f"Telegram alert failed: {e}")
+
+
 
 async def main() -> None:
-    # Logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     print("Futures bot starting...")
 
-    # Config yolu
     cfg_path_env = os.environ.get("FUTURE_TRADE_CONFIG")
     cfg_file = Path(cfg_path_env) if cfg_path_env else CONFIG_PATH
     logging.info(f"[CONFIG] using: {cfg_file}")
 
-    # Config yükle
-    cfg = await load_config(cfg_file)
-    logging.info("Config loaded OK")
-
-    
-
+    try:
+        cfg = await load_config(cfg_file)
+        logging.info("Config loaded OK")
+    except Exception as e:
+        logging.error(f"Config load failed: {e}")
+        await send_alert(f"❌ Config load failed: {e}")
+        return
 
     # Notifier
-    notifier = Notifier(cfg.get("telegram", {}))
-    await notifier.info_trades({"event": "startup", "msg": "Futures bot starting"})
+    try:
+        notifier = Notifier(cfg.get("telegram", {}))
+        await notifier.info_trades({"event": "startup", "msg": "✅ Notifier initialized"})
+        logging.info("Notifier initialized")
+    except Exception as e:
+        logging.error(f"Notifier init failed: {e}")
+        await send_alert(f"❌ Notifier init failed: {e}")
+        return
 
     # DB
-    persistence = Persistence(cfg["database"]["path"])
-    persistence.init_schema()
+    try:
+        persistence = Persistence(cfg["database"]["path"])
+        persistence.init_schema()
+        await notifier.info_trades({"event": "startup", "msg": "✅ Database schema OK"})
+        logging.info("Database schema initialized")
+    except Exception as e:
+        logging.error(f"Database init failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ DB init failed: {e}"})
+        return
 
-    # Binance client (testnet/live seçimi içeride)
-    client = BinanceClient(cfg["binance"], cfg.get("mode", "testnet"))
-    await client.bootstrap_exchange(cfg)  # positionSide / marginType / leverage vb.
+    # Binance client
+    try:
+        client = BinanceClient(cfg["binance"], cfg.get("mode", "testnet"))
+        await client.bootstrap_exchange(cfg)
+        await notifier.info_trades({"event": "startup", "msg": "✅ Binance client OK"})
+        logging.info("Binance client bootstrapped")
+    except Exception as e:
+        logging.error(f"Binance client failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ Binance client failed: {e}"})
+        return
 
     # Portföy ve Risk
-    portfolio = Portfolio(persistence)
-    risk = RiskManager(cfg.get("risk", {}), cfg.get("leverage", {}), portfolio)
+    try:
+        portfolio = Portfolio(persistence)
+        risk = RiskManager(cfg.get("risk", {}), cfg.get("leverage", {}), portfolio)
+        logging.info("Portfolio and RiskManager ready")
+    except Exception as e:
+        logging.error(f"Portfolio/RiskManager init failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ Portfolio/RiskManager failed: {e}"})
+        return
 
-    # Market stream (indices ile korelasyonlar için TOTAL3 / USDT.D / BTC.D)
-    stream = MarketStream(
-        cfg=cfg,
-        whitelist=cfg.get("symbols_whitelist", []),
-        indices=["TOTAL3", "USDT.D", "BTC.D"],
-        tf_entry=cfg.get("strategy", {}).get("timeframe_entry", "1h"),
-        tf_confirm=cfg.get("strategy", {}).get("confirm_tf", "4h"),
-        persistence=persistence,
-        client=client,
-    )
+    # Market stream
+    try:
+        stream = MarketStream(
+            cfg=cfg,
+            whitelist=cfg.get("symbols_whitelist", []),
+            indices=["TOTAL3", "USDT.D", "BTC.D"],
+            tf_entry=cfg.get("strategy", {}).get("timeframe_entry", "1h"),
+            tf_confirm=cfg.get("strategy", {}).get("confirm_tf", "4h"),
+            persistence=persistence,
+            client=client,
+        )
+        logging.info("MarketStream initialized")
+    except Exception as e:
+        logging.error(f"MarketStream init failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ MarketStream failed: {e}"})
+        return
 
-    # Strateji seçimi
-    strat_name = cfg.get("strategy", {}).get("name", "dominance_trend")
-    strat_cls = STRATEGY_REGISTRY.get(strat_name, DominanceTrend)
-    strategy: StrategyBase = strat_cls(cfg.get("strategy", {}))
+    # Strateji
+    try:
+        strat_name = cfg.get("strategy", {}).get("name", "dominance_trend")
+        strat_cls = STRATEGY_REGISTRY.get(strat_name, DominanceTrend)
+        strategy: StrategyBase = strat_cls(cfg.get("strategy", {}))
+        logging.info(f"Strategy selected: {strat_name}")
+    except Exception as e:
+        logging.error(f"Strategy init failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ Strategy failed: {e}"})
+        return
 
-    # OrderRouter config’ine leverage’ı da dahil et (görünebilir kıl)
-    router_cfg = dict(cfg.get("order", {}) or {})
-    router_cfg.setdefault("leverage", cfg.get("leverage", {}))
+    # Router, Reconciler, Supervisor
+    try:
+        router_cfg = dict(cfg.get("order", {}) or {})
+        router_cfg.setdefault("leverage", cfg.get("leverage", {}))
 
-    router = OrderRouter(client=client, cfg=router_cfg, notifier=notifier, persistence=persistence)
-    reconciler = OrderReconciler(client=client, persistence=persistence, notifier=notifier)
-    supervisor = PositionSupervisor(cfg, portfolio, notifier, persistence)
+        router = OrderRouter(client=client, cfg=router_cfg, notifier=notifier, persistence=persistence)
+        reconciler = OrderReconciler(client=client, persistence=persistence, notifier=notifier)
+        supervisor = PositionSupervisor(cfg, portfolio, notifier, persistence)
+        logging.info("OrderRouter, Reconciler, Supervisor ready")
+    except Exception as e:
+        logging.error(f"Router/Reconciler/Supervisor init failed: {e}")
+        await notifier.alert({"event": "startup_error", "msg": f"❌ Router/Reconciler/Supervisor failed: {e}"})
+        return
 
     # Graceful shutdown
     stop = asyncio.Event()
@@ -187,7 +243,6 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
-            # (Windows vb.)
             pass
 
     # Görevler
@@ -201,24 +256,22 @@ async def main() -> None:
         asyncio.create_task(trailing_loop(router, stream, notifier, cfg, stop), name="trailing"),
     ]
 
-    print("Futures bot running (press Ctrl+C to stop)")
+    await notifier.info_trades({"event": "startup", "msg": "✅ All modules initialized. Bot is running."})
+    logging.info("All tasks scheduled. Bot is running.")
+
     try:
         await stop.wait()
     finally:
-        # Taskleri iptal et ve bekle
         for t in tasks:
             t.cancel()
         with contextlib.suppress(Exception):
             await asyncio.gather(*tasks, return_exceptions=True)
-        # Client kapat
         with contextlib.suppress(Exception):
             await client.close()
-        # Notifier async kapatma varsa
         aclose = getattr(notifier, "aclose", None)
         if callable(aclose):
             with contextlib.suppress(Exception):
                 await aclose()
-
 
 # Modül doğrudan çalıştırılırsa:
 if __name__ == "__main__":

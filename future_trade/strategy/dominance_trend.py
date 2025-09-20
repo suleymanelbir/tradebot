@@ -3,11 +3,15 @@ LONG: TOTAL3(4H)>EMA20(4H) & TOTAL3(1H)>EMA20(1H) & Sym>EMA20(1H) & RSI(1H)<60 &
 SHORT: tersi; ADX>=20
 Not: Bu iskelette göstergesel değerler ctx['indices'] ve bar history'den gelecektir (TODO: gerçek hesap).
 """
-from typing import Dict, Any
+
 
 # /opt/tradebot/future_trade/strategy/dominance_trend.py
+
+from typing import Dict, Any
 from .base import StrategyBase, Signal
 from .indicators import ema, rsi, atr, adx
+import time
+
 
 class DominanceTrend(StrategyBase):
     def __init__(self, cfg: Dict[str, Any]):
@@ -15,8 +19,14 @@ class DominanceTrend(StrategyBase):
         self.smoke = bool(cfg.get("smoke", False))  # config’den alınır
 
     def on_bar(self, event: dict, ctx: dict) -> Signal:
+        # --- GEÇİCİ TEST MODU ---
+        test_force = self.cfg.get("force_paper_entries", False)
+        if test_force:
+            flip = (int(time.time()) // 60) % 2  # her dakika LONG-SHORT dönüşümlü
+            return Signal(side="LONG" if flip == 0 else "SHORT", strength=0.6)
+        # --- /GEÇİCİ ---
+
         if self.smoke:
-            # Smoke test modu: sabit LONG sinyali döner
             return Signal(side="LONG", strength=0.6)
 
         bars = event["bars"]

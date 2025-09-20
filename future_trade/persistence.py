@@ -5,6 +5,9 @@
 import sqlite3, json, time, logging
 from typing import Any, Dict, Optional, Iterable, List
 
+def now_ts() -> int:
+    return int(time.time())
+
 SCHEMA = [
     # Klines
     """
@@ -158,12 +161,10 @@ class Persistence:
     def set_cooldown(self, symbol: str, until_ts: int) -> None:
         with self._conn() as c:
             c.execute("""
-                INSERT INTO symbol_state(symbol, cooldown_until_ts, updated_at)
-                VALUES(?, ?, strftime('%s','now'))
-                ON CONFLICT(symbol)
-                DO UPDATE SET cooldown_until_ts=excluded.cooldown_until_ts,
-                              updated_at=excluded.updated_at
-            """, (symbol, int(until_ts)))
+              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
+              VALUES(?, '', ?, 0, NULL, NULL, NULL, ?)
+              ON CONFLICT(symbol) DO UPDATE SET cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
+            """, (symbol, int(until_ts), now_ts()))
             c.commit()
 
     def get_cooldown(self, symbol: str) -> int:
@@ -185,16 +186,16 @@ class Persistence:
 
             return 0
 
-    def mark_exit_ts(self, symbol: str, ts: int) -> None:
+    def mark_exit_ts(self, symbol: str, ts: Optional[int] = None) -> None:
+        ts = ts or now_ts()
         with self._conn() as c:
             c.execute("""
-                INSERT INTO symbol_state(symbol, last_exit_ts, updated_at)
-                VALUES(?, ?, strftime('%s','now'))
-                ON CONFLICT(symbol)
-                DO UPDATE SET last_exit_ts=excluded.last_exit_ts,
-                              updated_at=excluded.updated_at
-            """, (symbol, int(ts)))
+              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
+              VALUES(?, '', 0, ?, NULL, NULL, NULL, ?)
+              ON CONFLICT(symbol) DO UPDATE SET last_signal_ts=excluded.last_signal_ts, updated_at=excluded.updated_at
+            """, (symbol, int(ts), now_ts()))
             c.commit()
+
 
     def set_trail_stop(self, symbol: str, value: Optional[float]) -> None:
         with self._conn() as c:
@@ -232,19 +233,18 @@ class Persistence:
 
     # --------------------------- Positions ---------------------------
 
-    def upsert_position(self, symbol: str, side: str, qty: float,
-                        entry_price: float, leverage: int,
-                        unrealized_pnl: float = 0.0) -> None:
-        now = int(time.time())
+    def upsert_position(self, symbol: str, side: str, qty: float, entry_price: float, leverage: int = 1) -> None:
         with self._conn() as c:
             c.execute("""
                 INSERT INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol)
-                DO UPDATE SET side=excluded.side, qty=excluded.qty, entry_price=excluded.entry_price,
-                              leverage=excluded.leverage, unrealized_pnl=excluded.unrealized_pnl,
-                              updated_at=excluded.updated_at
-            """, (symbol, side, float(qty), float(entry_price), int(leverage), float(unrealized_pnl), now))
+                VALUES(?,?,?,?,?,0,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  side=excluded.side,
+                  qty=excluded.qty,
+                  entry_price=excluded.entry_price,
+                  leverage=excluded.leverage,
+                  updated_at=excluded.updated_at
+            """, (symbol, side, float(qty), float(entry_price), int(leverage), now_ts()))
             c.commit()
 
     def delete_position(self, symbol: str) -> None:
@@ -257,6 +257,26 @@ class Persistence:
             cur = c.execute("SELECT * FROM futures_positions WHERE ABS(qty) > 0 ORDER BY updated_at DESC")
             return [dict(r) for r in cur.fetchall()]
 
+    def close_position(self, symbol: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?", (now_ts(), symbol))
+            # state dokun: en azından updated_at güncellensin
+            c.execute("""
+              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
+              VALUES(?, COALESCE((SELECT state FROM symbol_state WHERE symbol=?), ''), 0, COALESCE((SELECT last_signal_ts FROM symbol_state WHERE symbol=?), 0), NULL, NULL, NULL, ?)
+              ON CONFLICT(symbol) DO UPDATE SET updated_at=excluded.updated_at
+            """, (symbol, symbol, symbol, now_ts()))
+            c.commit()
+
+    def list_open_positions(self) -> List[Dict[str, Any]]:
+        with self._conn() as c:
+            cur = c.execute("SELECT symbol, side, qty, entry_price, leverage, updated_at FROM futures_positions WHERE ABS(qty) > 0")
+            rows = cur.fetchall()
+            return [
+                {"symbol": r[0], "side": r[1], "qty": float(r[2]), "entry_price": float(r[3]), "leverage": int(r[4]), "updated_at": int(r[5])}
+                for r in rows
+            ]
+
     def position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._conn() as c:
             cur = c.execute("SELECT * FROM futures_positions WHERE symbol=?", (symbol,))
@@ -265,21 +285,15 @@ class Persistence:
 
     # --------------------------- Orders & Trades ---------------------------
 
-    def record_order(self, client_id: str, symbol: str, side: str, type_: str,
-                     status: str, price: Optional[float], qty: float,
-                     reduce_only: bool = False, extra: Optional[Dict[str, Any]] = None) -> int:
-        now = int(time.time())
+    def record_order(self, client_id: str, symbol: str, side: str, typ: str, status: str,
+                     price: float, qty: float, reduce_only: bool, extra_json: Optional[Dict[str, Any]] = None) -> None:
         with self._conn() as c:
-            cur = c.execute("""
-                INSERT INTO futures_orders(client_id, symbol, side, type, status,
-                                           price, qty, reduce_only, created_at, updated_at, extra_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (client_id, symbol, side, type_, status,
-                  None if price is None else float(price),
-                  float(qty), 1 if reduce_only else 0, now, now,
-                  json.dumps(extra or {}, ensure_ascii=False)))
+            c.execute("""
+                INSERT INTO futures_orders(client_id, symbol, side, type, status, price, qty, reduce_only, created_at, updated_at, extra_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, (client_id, symbol, side, typ, status, float(price), float(qty), 1 if reduce_only else 0, now_ts(), now_ts(),
+                  json.dumps(extra_json or {}, ensure_ascii=False)))
             c.commit()
-            return int(cur.lastrowid)
 
     def update_order_status(self, client_id: str, status: str,
                             price: Optional[float] = None,
