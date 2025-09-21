@@ -24,6 +24,9 @@ Logları izle: sudo journalctl -u tradebot-global.service -f
 # 📦 Standart Kütüphaneler
 # ─────────────────────────────────────────────
 import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="/opt/tradebot/trade_env/.env")
+import sys
 import json
 import sqlite3
 import logging
@@ -32,37 +35,21 @@ import time
 import tempfile
 import shutil
 import random
-import json
+import math
+import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-import math
-from typing import Tuple
-
-# ─────────────────────────────────────────────
-# 🧠 Tip Belirtimleri
-# ─────────────────────────────────────────────
-from typing import Any, Dict, List, Optional, Literal
-
-# ─────────────────────────────────────────────
-# 📝 Loglama Araçları
-# ─────────────────────────────────────────────
+from typing import Any, Dict, List, Optional, Literal, Tuple
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
-# ─────────────────────────────────────────────
-# 🌐 HTTP İstekleri
-# ─────────────────────────────────────────────
+# JSON logger için
+from pythonjsonlogger import jsonlogger as JsonFormatter
 
+# HTTP istekleri için
 import requests
-import time
-import logging
-import html
 
-# ─────────────────────────────────────────────
-# 🎭 Playwright (aktif kullanım için açık bırakıldı)
-# ─────────────────────────────────────────────
+# Playwright (aktif kullanım için)
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-
 print("✅ Script başladı")
 # ─────────────────────────────────────────────
 # 📁 Merkezî Yol Sabitleri (ENV ile override edilebilir)
@@ -216,24 +203,38 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_record)
     
 def setup_logging(log_path: str, max_bytes=2_000_000, backup_count=3):
+    # 🔧 Log klasörü yoksa oluştur
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    # 🔧 Logger tanımı
     logger = logging.getLogger("tradebot_logger")
-    logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    # Genel log dosyası
+    # 🔧 Log seviyesi .env üzerinden alınır, yoksa INFO
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logger.setLevel(getattr(logging, log_level, logging.INFO))
+
+    # 📁 Genel log dosyası
     main_handler = RotatingFileHandler(log_path, maxBytes=max_bytes, backupCount=backup_count)
-    main_handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    main_handler.setFormatter(JsonFormatter.JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
     logger.addHandler(main_handler)
 
     # 🔔 Hatalar için ayrı alerts.log dosyası
     alerts_path = os.path.join(os.path.dirname(log_path), "alerts.log")
     alerts_handler = RotatingFileHandler(alerts_path, maxBytes=1_000_000, backupCount=2)
-    alerts_handler.setLevel(logging.ERROR)  # Sadece ERROR ve üstü
-    alerts_handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    alerts_handler.setLevel(logging.ERROR)
+    alerts_handler.setFormatter(JsonFormatter.JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
     logger.addHandler(alerts_handler)
 
+    # 🖥️ Systemd journal için terminale yönlendirme
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(JsonFormatter.JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    logger.addHandler(stream_handler)
+
+    # 🧾 Başlangıç logları
     logger.info("Log sistemi JSON formatında başlatıldı.")
     logger.info("RUNNING_FROM_FILE=%s", __file__)
+
     return logger
 
 

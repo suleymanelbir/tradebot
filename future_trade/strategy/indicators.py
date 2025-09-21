@@ -78,3 +78,7 @@ def adx(highs: List[float], lows: List[float], closes: List[float], period: int 
     for d in dxs[period:]:
         adx_val = (adx_val * (period - 1) + d) / period
     return adx_val
+
+    def adx_placeholder(series: List[float], period: int = 14) -> float:
+        # gerçek ADX değil; şimdilik sabit/orta değer dönelim
+        return 25.0

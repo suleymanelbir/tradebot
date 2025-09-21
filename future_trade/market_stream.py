@@ -142,57 +142,44 @@ class MarketStream:
 
 
     async def run(self):
+        tick = 0
         poll_sec = 60
         while True:
             try:
-                # Paper test modu aktifse sentetik veri üret
-                if getattr(self.cfg, "force_paper_stream", False):
-                    now = int(time.time())
-                    for sym in self.whitelist:
-                        price = self._mock_price(sym, now)
-                        event = {
-                            "type": "bar_closed",
-                            "symbol": sym,
-                            "tf": self.tf_entry,
-                            "close": price,
-                            "time": now
-                        }
-                        self._last_prices[sym] = price
-                        await self._q.put(event)
-                    # İndeks güncellemesi hâlâ yapılabilir
-                    self._refresh_indices()
-                    await asyncio.sleep(poll_sec)
-                    continue
-
-                # Gerçek veri akışı (Binance Kline)
-                self._refresh_indices()  # <<< artık var
+                now = int(time.time())
                 for sym in self.whitelist:
-                    try:
-                        bars = await self._fetch_1h_bars(sym, limit=150)
+                    # Daha belirgin sahte fiyat üretimi (100–119 arası gezinir)
+                    fake_close = 100.0 + (tick % 20)
+                    event = {
+                        "type": "bar_closed",
+                        "symbol": sym,
+                        "tf": self.tf_entry,  # örn: "1h"
+                        "close": fake_close,
+                        "time": now
+                    }
+                    self._last_prices[sym] = fake_close
+                    await self._q.put(event)
 
-                        # 1) Gerçek bar_closed eventi
-                        ev = {"type": "bar_closed", "symbol": sym, "tf": "1h", "bars": bars}
-                        await self._q.put(ev)
+                # Dummy indeks snapshot (ileride global veritabanından alınabilir)
+                self._indices_cache = {
+                    "TOTAL3": {
+                        "tf1h": {"ema20": 0.0, "close": 0.0},
+                        "tf4h": {"ema20": 0.0, "close": 0.0}
+                    },
+                    "USDT.D": {
+                        "tf1h": {"ema20": 0.0, "close": 0.0}
+                    },
+                    "BTC.D": {
+                        "tf1h": {"ema20": 0.0, "close": 0.0}
+                    }
+                }
 
-                        # 2) Sentetik bar_closed (örnekleme amaçlı)
-                        now = int(time.time())
-                        event = {
-                            "type": "bar_closed",
-                            "symbol": sym,
-                            "tf": self.tf_entry,
-                            "close": 100.0,
-                            "time": now
-                        }
-                        self._last_prices[sym] = event["close"]
-                        await self._q.put(event)
-
-                    except Exception as se:
-                        logging.warning(f"kline fetch failed for {sym}: {se}")
+                tick += 1
             except Exception as e:
                 logging.error(f"stream error: {e}")
             await asyncio.sleep(poll_sec)
-
-
+            
+            
     async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
         while True:
             ev = await self._q.get(); yield ev

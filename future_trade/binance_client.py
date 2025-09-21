@@ -50,6 +50,17 @@ class BinanceClient:
             payload.update(extra)
         return payload
 
+    # binance_client.py -- sınıfa ekle
+    async def klines(self, symbol: str, interval: str = "1h", limit: int = 150):
+        """
+        USDT-M futures klines. Dönüş: [ [open_time, open, high, low, close, volume, close_time, ...], ... ]
+        """
+        r = await self._client.get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
+        r.raise_for_status()
+        return r.json()
+
+
+
     async def _signed(self, method: str, path: str, params: Dict[str, Any] | None) -> Dict[str, Any]:
         if self.paper:
             # ağ yok; sadece izleme amaçlı stub dön
