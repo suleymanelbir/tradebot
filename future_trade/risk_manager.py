@@ -6,6 +6,8 @@
 
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
+from .exchange_utils import symbol_filters, quantize, price_quantize
+
 
 @dataclass
 class TradePlan:
@@ -26,25 +28,42 @@ class RiskManager:
 
     # risk_manager.py -- plan_trade() yeniden
     def plan_trade(self, symbol: str, signal) -> TradePlan:
-        equity = float(self.portfolio.equity())
-        per_pct = float(self.cfg.get("per_trade_risk_pct", 0.5)) / 100.0
-        entry = 100.0  # default
-        # entry'i sinyal event'inden almak daha doğru; biz app.py’de event'i persistence'a yazmadık.
-        # market_stream close'u strateji içinde var; burada varsayım: 100.0
-        # İstersen signal objesine 'ref_price' ekleyebiliriz.
-        if signal.side == "LONG":
-            sl = entry * 0.99; tp = entry * 1.02
-        elif signal.side == "SHORT":
-            sl = entry * 1.01; tp = entry * 0.98
-        else:
-            return TradePlan(ok=False, reason="signal_flat")
+        # 1) Basit giriş/SL/TP (ileride gerçek hesapla değiştireceğiz)
+        entry = 100.0
+        sl    = 98.0 if signal.side == "LONG" else 102.0
+        tp    = 103.0 if signal.side == "LONG" else 97.0
 
         dist = abs(entry - sl)
         if dist <= 0:
-            return TradePlan(ok=False, reason="invalid_stop_distance")
+            return TradePlan(ok=False, reason="invalid stop distance")
 
+        # 2) Risk bazlı qty
+        equity  = self.portfolio.equity()
+        per_pct = float(self.cfg.get("per_trade_risk_pct", 0.5)) / 100.0
         risk_cap = equity * per_pct
-        qty = max(risk_cap / dist, 0.0)
+        raw_qty = risk_cap / dist
 
-        return TradePlan(ok=True, symbol=symbol, side=signal.side, entry=entry, qty=qty, sl=sl, tp=tp)
+        # 3) Borsa filtreleri → step/tick/minNotional
+        try:
+            ex_info = getattr(self.portfolio, "exchange_info_cache", None) or {}
+            tick, step, min_notional = symbol_filters(ex_info, symbol)
+        except Exception:
+            tick, step, min_notional = 0.01, 0.001, 5.0
+
+        qty = max(quantize(raw_qty, step), step)
+        q_entry = price_quantize(entry, tick)
+        q_sl    = price_quantize(sl, tick)
+        q_tp    = price_quantize(tp, tick)
+
+        # 4) Min notional kontrolü
+        notional = q_entry * qty
+        buf = float(self.cfg.get("min_notional_buffer", 1.1))
+        if notional < (min_notional * buf):
+            need_qty = (min_notional * buf) / max(q_entry, 1e-9)
+            qty = max(quantize(need_qty, step), step)
+            notional = q_entry * qty
+            if notional < min_notional:
+                return TradePlan(ok=False, reason="below_min_notional")
+
+        return TradePlan(ok=True, symbol=symbol, side=signal.side, entry=q_entry, qty=qty, sl=q_sl, tp=q_tp)
 

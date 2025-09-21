@@ -1,6 +1,6 @@
 # /opt/tradebot/future_trade/app.py
 from __future__ import annotations
-
+import time
 import asyncio
 import logging
 import os
@@ -50,9 +50,6 @@ async def strat_loop(
     notifier: Notifier,
     cfg: Dict[str, Any],
 ) -> None:
-    """
-    Kapanan barlarda sinyal üret → süpervizör & risk kontrol → emir akışı.
-    """
     signal: Optional[Signal] = None
 
     async for event in stream.events():
@@ -61,6 +58,13 @@ async def strat_loop(
 
         symbol = event.get("symbol")
         if not symbol or symbol not in cfg.get("symbols_whitelist", []):
+            continue
+
+        # ⛔️ Cooldown kontrolü (entry denemesi öncesi)
+        now_ts = int(time.time())
+        cd = persistence.get_cooldown(symbol)
+        if cd and cd > now_ts:
+            await notifier.debug_trades({"event": "entry_rejected", "symbol": symbol, "reason": "cooldown_active"})
             continue
 
         # Sinyal üretimi
@@ -75,26 +79,38 @@ async def strat_loop(
         # Giriş uygun mu?
         ok, reason = supervisor.evaluate_entry(symbol, signal)
         if not ok:
-            await notifier.debug_trades(
-                {"event": "entry_rejected", "symbol": symbol, "reason": reason}
-            )
-            # İstersen şurayı açıp reddedilen sinyali de audit’e yazabilirsin:
-            # persistence.record_signal_audit(event, signal, decision=False, reason=reason)
+            await notifier.debug_trades({"event": "entry_rejected", "symbol": symbol, "reason": reason})
             continue
 
         # Boyutlandırma
         plan = risk.plan_trade(symbol, signal)
         if not plan.ok:
-            await notifier.debug_trades(
-                {"event": "sizing_rejected", "symbol": symbol, "reason": plan.reason}
-            )
-            # persistence.record_signal_audit(event, signal, decision=False, reason=plan.reason)
+            await notifier.debug_trades({"event": "sizing_rejected", "symbol": symbol, "reason": plan.reason})
             continue
 
         # Emir akışı
         try:
             await router.place_entry_with_protection(plan)
             persistence.record_signal_audit(event, signal, decision=True)
+
+            # ✅ Dinamik cooldown hesapla ve yaz
+            base = int(cfg.get("cooldown_sec_base", 300))  # 5 dk varsayılan
+            vol_factor = 1.0   # TODO: ATR/vol’dan türet
+            freq_factor = 1.0  # TODO: son N barda kaç entry denendi?
+            sig_factor = max(0.5, min(1.5, getattr(signal, "strength", 0.6)))  # 0.5–1.5 arası ör.
+            tf = cfg["strategy"]["timeframe_entry"]
+            tf_factor = 1 if tf == "1h" else (4 if tf == "4h" else 1)
+
+            cooldown_sec = int(base * vol_factor * freq_factor * sig_factor * tf_factor)
+            until = int(time.time()) + cooldown_sec
+            persistence.set_cooldown(symbol, until)
+            await notifier.debug_trades({
+                "event": "cooldown_set",
+                "symbol": symbol,
+                "until": until,
+                "sec": cooldown_sec
+            })
+
         except Exception as e:
             await notifier.alert({"event": "order_error", "symbol": symbol, "error": str(e)})
             persistence.record_signal_audit(event, signal, decision=False, reason=str(e))

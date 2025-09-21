@@ -1,32 +1,34 @@
 # /opt/tradebot/future_trade/exchange_utils.py
 from math import floor
+from typing import Dict, Tuple
 
-def quantize(val: float, step: float) -> float:
-    """Adedi (LOT_SIZE.stepSize) gridine yuvarla."""
-    if step <= 0:
-        return float(val)
-    return floor(float(val) / step) * step
 
-def price_quantize(val: float, tick: float) -> float:
-    """Fiyatı (PRICE_FILTER.tickSize) gridine yuvarla."""
-    if tick <= 0:
-        return float(val)
-    return floor(float(val) / tick) * tick
+def _find(sym_info: Dict, ftype: str) -> Dict:
+    for f in sym_info.get("filters", []):
+        if f.get("filterType") == ftype:
+            return f
+    return {}
 
-def symbol_filters(exchange_info: dict, symbol: str):
-    """exchangeInfo içinden tickSize, stepSize, minNotional döndür."""
-    for s in exchange_info.get("symbols", []):
-        if s["symbol"] == symbol:
-            tick = step = min_notional = 0.0
-            for f in s.get("filters", []):
-                t = f.get("filterType")
-                if t == "PRICE_FILTER":
-                    tick = float(f["tickSize"])
-                elif t == "LOT_SIZE":
-                    step = float(f["stepSize"])
-                elif t == "MIN_NOTIONAL":
-                    # USDT-M futures'ta 'notional' anahtarı kullanılıyor
-                    # bazı hesaplarda 'minNotional' olabilir, ikisini de dene
-                    min_notional = float(f.get("notional") or f.get("minNotional") or 0.0)
+def quantize(qty: float, step: float) -> float:
+    if step <= 0: return qty
+    return float((int(qty / step)) * step)
+
+def price_quantize(px: float, tick: float) -> float:
+    if tick <= 0: return px
+    return float((int(px / tick)) * tick)
+
+def symbol_filters(ex_info: Dict, symbol: str) -> Tuple[float, float, float]:
+    """
+    return: tickSize, stepSize, minNotional
+    """
+    for s in ex_info.get("symbols", []):
+        if s.get("symbol") == symbol:
+            pf = _find(s, "PRICE_FILTER")
+            lf = _find(s, "LOT_SIZE")
+            nf = _find(s, "MIN_NOTIONAL") or {}
+            tick = float(pf.get("tickSize", "0.01") or 0.01)
+            step = float(lf.get("stepSize", "0.001") or 0.001)
+            min_notional = float(nf.get("notional", "5") or 5.0)
             return tick, step, min_notional
-    raise KeyError(f"symbol {symbol} not found in exchangeInfo")
+    # güvenli varsayılanlar
+    return 0.01, 0.001, 5.0

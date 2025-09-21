@@ -19,7 +19,7 @@ from typing import Dict, Any, List, Optional
 from .exchange_utils import quantize, price_quantize, symbol_filters
 from .strategy.indicators import atr  # ATR hesaplamak için
 from .exchange_utils import quantize, price_quantize, symbol_filters
-
+from .trailing_stop import percent_trailing
 from .persistence import Persistence
 
 
@@ -308,13 +308,15 @@ class OrderRouter:
                     logging.debug(f"cancel protect fail {symbol}: {ce}")
 
 
+  
+
     async def update_trailing_for_open_positions(self, stream, trailing_cfg: Dict[str, Any]):
         """
         Gerçek modda:
         - ATR tabanlı trailing SL güncellemesi
         - STOP_MARKET closePosition=true ile emir gönderimi
         PAPER modda:
-        - Basit % trailing hesaplanır
+        - Basit % trailing hesaplanır (percent_trailing ile)
         - symbol_state.trail_stop güncellenir
         - trades_bot'a trailing_updated mesajı gönderilir
         """
@@ -336,8 +338,7 @@ class OrderRouter:
         paper_mode = self.cfg.get("mode", "paper").lower() == "paper"
 
         if paper_mode:
-            # PAPER mod: basit % trailing
-            now = int(time.time())
+            # PAPER mod: percent_trailing ile güncelle
             conn = self.persistence._conn()
             try:
                 cur = conn.cursor()
@@ -345,22 +346,29 @@ class OrderRouter:
                     last = stream.get_last_price(sym) or 0.0
                     if not last:
                         continue
+
+                    # Önceki trail_stop'u çek
+                    prev_trail = None
+                    cur.execute("SELECT trail_stop FROM symbol_state WHERE symbol=?", (sym,))
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        prev_trail = float(row[0])
+
                     pct = float(trailing_cfg.get("step_pct", 0.1))
-                    if side == "LONG":
-                        trail = last * (1 - pct / 100.0)
-                    else:
-                        trail = last * (1 + pct / 100.0)
-                    cur.execute("""
-                        INSERT INTO symbol_state(symbol, trail_stop, updated_at)
-                        VALUES(?, ?, ?)
-                        ON CONFLICT(symbol) DO UPDATE SET trail_stop=excluded.trail_stop, updated_at=excluded.updated_at
-                    """, (sym, float(trail), now))
-                    await self.notifier.debug_trades({
-                        "event": "trailing_updated",
-                        "symbol": sym,
-                        "side": side,
-                        "stop": float(trail)
-                    })
+                    new_trail = percent_trailing("LONG" if side == "LONG" else "SHORT", last, prev_trail, pct)
+
+                    if new_trail != prev_trail:
+                        cur.execute("""
+                            INSERT INTO symbol_state(symbol, trail_stop, updated_at)
+                            VALUES(?, ?, ?)
+                            ON CONFLICT(symbol) DO UPDATE SET trail_stop=excluded.trail_stop, updated_at=excluded.updated_at
+                        """, (sym, float(new_trail), now))
+                        await self.notifier.debug_trades({
+                            "event": "trailing_updated",
+                            "symbol": sym,
+                            "side": side,
+                            "stop": float(new_trail)
+                        })
                 conn.commit()
             finally:
                 conn.close()
