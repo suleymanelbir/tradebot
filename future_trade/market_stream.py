@@ -10,6 +10,11 @@ import asyncio
 import logging
 import sqlite3
 import time
+
+from collections import deque
+import random
+
+
 # Tip tanımları
 from typing import Dict, Any, List, AsyncGenerator, TYPE_CHECKING
 
@@ -50,6 +55,7 @@ class MarketStream:
         self._indices_cache: Dict[str, Any] = {} # TOTAL3/USDT.D/BTC.D snapshot
         self._last_prices: Dict[str, float] = {}
         self.global_db = self.cfg.get("global_db_path", "/opt/tradebot/veritabani/global_data.db")
+        self._series: Dict[str, deque] = {sym: deque(maxlen=100) for sym in whitelist}
 
 
     async def _fetch_1h_bars(self, symbol: str, limit: int = 150):
@@ -139,6 +145,15 @@ class MarketStream:
         base = 100.0
         return base + 5.0 * math.sin(now / 60.0)  # ~1 dakikada bir salınsın
 
+    def _ema(self, values, period=20):
+        if not values or len(values) < period:
+            return 0.0  # Yetersiz veri varsa None yerine güvenli varsayılan
+        k = 2 / (period + 1)
+        ema = values[0]
+        for v in values[1:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
 
 
     async def run(self):
@@ -147,17 +162,26 @@ class MarketStream:
         while True:
             try:
                 now = int(time.time())
+                base = getattr(self, "_base_price", 100.0)
+
                 for sym in self.whitelist:
-                    # Daha belirgin sahte fiyat üretimi (100–119 arası gezinir)
-                    fake_close = 100.0 + (tick % 20)
+                    # küçük gürültü ile fiyat salla (paper için yeterli)
+                    base += random.uniform(-0.5, 0.5)
+                    self._series[sym].append(base)
+
+                    # EMA hesapla (son 20 bar üzerinden)
+                    ema20 = self._ema(list(self._series[sym]), 20)
+
+                    # bar_closed event oluştur
                     event = {
                         "type": "bar_closed",
                         "symbol": sym,
-                        "tf": self.tf_entry,  # örn: "1h"
-                        "close": fake_close,
+                        "tf": self.tf_entry,
+                        "close": base,
+                        "ema20": ema20,
                         "time": now
                     }
-                    self._last_prices[sym] = fake_close
+                    self._last_prices[sym] = base
                     await self._q.put(event)
 
                 # Dummy indeks snapshot (ileride global veritabanından alınabilir)

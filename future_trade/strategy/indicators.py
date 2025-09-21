@@ -2,6 +2,9 @@
 from typing import List
 from math import isnan
 
+
+
+
 def ema(values: List[float], period: int) -> float:
     if not values: return 0.0
     k = 2.0 / (period + 1.0)
@@ -79,6 +82,6 @@ def adx(highs: List[float], lows: List[float], closes: List[float], period: int 
         adx_val = (adx_val * (period - 1) + d) / period
     return adx_val
 
-    def adx_placeholder(series: List[float], period: int = 14) -> float:
-        # gerçek ADX değil; şimdilik sabit/orta değer dönelim
-        return 25.0
+def adx_placeholder(series: List[float], period: int = 14) -> float:
+    # gerçek ADX değil; şimdilik sabit/orta değer dönelim
+    return 25.0

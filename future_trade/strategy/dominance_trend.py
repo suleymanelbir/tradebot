@@ -24,22 +24,14 @@ class DominanceTrend(StrategyBase):
         self.adx_min = float(cfg.get("params", {}).get("adx_min", 20))
 
     def on_bar(self, bar_event: Dict[str, Any], ctx: Dict[str, Any]) -> Signal:
-        sym = bar_event["symbol"]; close = float(bar_event.get("close", 0))
-        buf = self._closes.setdefault(sym, [])
-        buf.append(close)
-        if len(buf) < max(self.ema_p, self.rsi_p) + 2:
-            return Signal(side="FLAT", strength=0.0)  # yeterli veri yok
+        close = bar_event.get("close")
+        ema20 = bar_event.get("ema20")
+        if close is None or ema20 is None:
+            return Signal(side="FLAT", strength=0.0)
 
-        ema1h = ema(buf[-(self.ema_p+2):], self.ema_p)
-        rsi1h = rsi(buf[-(self.rsi_p+2):], self.rsi_p)
-        adx = adx_placeholder(buf, self.adx_p)
-
-        # index snapshot'tan da koşullar gelecekti; paper için sadeleştiriyoruz:
-        long_ok  = close > ema1h and rsi1h < 60 and adx >= self.adx_min
-        short_ok = close < ema1h and adx >= self.adx_min
-
-        if long_ok and not short_ok:
+        if close > ema20:
             return Signal(side="LONG", strength=0.6)
-        if short_ok and not long_ok:
+        elif close < ema20:
             return Signal(side="SHORT", strength=0.6)
-        return Signal(side="FLAT", strength=0.0)
+        else:
+            return Signal(side="FLAT", strength=0.0)
