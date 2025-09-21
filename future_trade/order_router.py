@@ -20,7 +20,7 @@ from .exchange_utils import quantize, price_quantize, symbol_filters
 from .strategy.indicators import atr  # ATR hesaplamak için
 from .exchange_utils import quantize, price_quantize, symbol_filters
 
-
+from .persistence import Persistence
 
 
 class OrderRouter:
@@ -29,7 +29,7 @@ class OrderRouter:
         self.cfg = cfg
         self.notifier = notifier
         self.persistence = persistence
-        self._exi_cache = None
+       
         
     async def _exi(self):
         if self._exi_cache is None:
@@ -74,7 +74,6 @@ class OrderRouter:
         """
         PAPER modda:
         - futures_positions'a upsert (qty sign: LONG=+, SHORT=-)
-        - symbol_state'e trail_stop/peak/trough başlangıçları
         - trades_bot'a entry/sl/tp 'ack' mesajları
         Gerçekte:
         - Binance order gönderilecek (ileride live moda geçince)
@@ -157,34 +156,74 @@ class OrderRouter:
 
         # 6) TAKE PROFIT
         tp_mode = str(self.cfg.get("tp_mode", "MARKET")).upper()
-        if tp_price:
-            if tp_mode == "MARKET":
-                tp_params = {
+        if tp_price and tp_mode == "MARKET":
+            tp_params = {
+                "symbol": sym,
+                "side": opp,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": tp_price,
+                "closePosition": "true",
+                "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
+                "newClientOrderId": self._cid("tp"),
+            }
+            try:
+                od_tp = await self._place_idempotent(tp_params, "take_profit")
+                await self.notifier.debug_trades({
+                    "event": "tp_ack",
                     "symbol": sym,
-                    "side": opp,
-                    "type": "TAKE_PROFIT_MARKET",
-                    "stopPrice": tp_price,
-                    "closePosition": "true",
-                    "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                    "newClientOrderId": self._cid("tp"),
-                }
-                try:
-                    od_tp = await self._place_idempotent(tp_params, "take_profit")
+                    "orderId": od_tp.get("orderId"),
+                    "tp": tp_price
+                })
+            except Exception as e:
+                await self.notifier.alert({
+                    "event": "order_error",
+                    "symbol": sym,
+                    "stage": "take_profit",
+                    "error": str(e)
+                })
+
+        # 7) PAPER modda DB’ye yaz + Telegram bildirimi
+        if self.cfg.get("mode", "PAPER").upper() == "PAPER":
+            await self.notifier.trade({
+                "event": "entry",
+                "symbol": plan.symbol,
+                "side": plan.side,
+                "qty": float(plan.qty)
+            })
+
+            conn = self.persistence._conn()
+            try:
+                cur = conn.cursor()
+                qty_signed = float(plan.qty) if plan.side == "LONG" else -float(plan.qty)
+                cur.execute("""
+                    INSERT OR REPLACE INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, (
+                    plan.symbol,
+                    plan.side,
+                    qty_signed,
+                    float(plan.entry or 0.0),
+                    1,
+                    int(time.time())
+                ))
+                conn.commit()
+
+                # SL/TP “ack” mesajları (paper)
+                if plan.sl:
+                    await self.notifier.debug_trades({
+                        "event": "sl_ack",
+                        "symbol": plan.symbol,
+                        "stop": plan.sl
+                    })
+                if plan.tp:
                     await self.notifier.debug_trades({
                         "event": "tp_ack",
-                        "symbol": sym,
-                        "orderId": od_tp.get("orderId"),
-                        "tp": tp_price
+                        "symbol": plan.symbol,
+                        "tp": plan.tp
                     })
-                except Exception as e:
-                    await self.notifier.alert({
-                        "event": "order_error",
-                        "symbol": sym,
-                        "stage": "take_profit",
-                        "error": str(e)
-                    })
-
-        
+            finally:
+                conn.close()
+            
 
     # 6) (DB tarafı) — Reconciler borsadan okuyacağı için burada ek işlem zorunlu değil.
 
@@ -294,47 +333,43 @@ class OrderRouter:
             return
 
         # PAPER mod kontrolü
-        paper_mode = self.cfg.get("mode", "paper") == "paper"
+        paper_mode = self.cfg.get("mode", "paper").lower() == "paper"
 
         if paper_mode:
             # PAPER mod: basit % trailing
-            for sym, side, qty in rows:
-                if sym not in stream.whitelist:
-                    continue
-                last = stream._mock_price(sym, now)
-                with self.persistence._conn() as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT trail_stop FROM symbol_state WHERE symbol=?", (sym,))
-                    r = cur.fetchone()
-                    prev = None if r is None else r[0]
-
-                if side == "LONG":
-                    new_ts = max(prev or 0.0, last * (1 - step_pct))
-                    improved = (prev is None) or (new_ts > prev)
-                else:
-                    new_ts = min(prev or 1e18, last * (1 + step_pct))
-                    improved = (prev is None) or (new_ts < prev)
-
-                if improved:
-                    with self.persistence._conn() as conn:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "UPDATE symbol_state SET trail_stop=?, updated_at=? WHERE symbol=?",
-                            (new_ts, now, sym)
-                        )
-                        conn.commit()
+            now = int(time.time())
+            conn = self.persistence._conn()
+            try:
+                cur = conn.cursor()
+                for sym, side, qty in rows:
+                    last = stream.get_last_price(sym) or 0.0
+                    if not last:
+                        continue
+                    pct = float(trailing_cfg.get("step_pct", 0.1))
+                    if side == "LONG":
+                        trail = last * (1 - pct / 100.0)
+                    else:
+                        trail = last * (1 + pct / 100.0)
+                    cur.execute("""
+                        INSERT INTO symbol_state(symbol, trail_stop, updated_at)
+                        VALUES(?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET trail_stop=excluded.trail_stop, updated_at=excluded.updated_at
+                    """, (sym, float(trail), now))
                     await self.notifier.debug_trades({
                         "event": "trailing_updated",
                         "symbol": sym,
                         "side": side,
-                        "stop": round(new_ts, 4)
+                        "stop": float(trail)
                     })
+                conn.commit()
+            finally:
+                conn.close()
             return
 
         # GERÇEK mod: ATR tabanlı trailing SL
         exi = await self._exi()
 
-        for sym, qty, side in rows:
+        for sym, side, qty in rows:
             try:
                 if (side == "LONG" and qty < 0) or (side == "SHORT" and qty > 0):
                     await self.notifier.alert({
@@ -353,8 +388,8 @@ class OrderRouter:
                     continue
 
                 closes = [float(k[4]) for k in kl]
-                highs  = [float(k[2]) for k in kl]
-                lows   = [float(k[3]) for k in kl]
+                highs = [float(k[2]) for k in kl]
+                lows = [float(k[3]) for k in kl]
 
                 atr_val = atr(highs, lows, closes, period=atr_period)
                 if not atr_val or math.isnan(atr_val):

@@ -184,25 +184,14 @@ class MarketStream:
                     self._last_prices[sym] = base
                     await self._q.put(event)
 
-                # Dummy indeks snapshot (ileride global veritabanından alınabilir)
-                self._indices_cache = {
-                    "TOTAL3": {
-                        "tf1h": {"ema20": 0.0, "close": 0.0},
-                        "tf4h": {"ema20": 0.0, "close": 0.0}
-                    },
-                    "USDT.D": {
-                        "tf1h": {"ema20": 0.0, "close": 0.0}
-                    },
-                    "BTC.D": {
-                        "tf1h": {"ema20": 0.0, "close": 0.0}
-                    }
-                }
+                # 🔄 Endeks snapshot: global_data.db'den gerçek veriyi çek
+                self._refresh_indices()
 
                 tick += 1
             except Exception as e:
                 logging.error(f"stream error: {e}")
             await asyncio.sleep(poll_sec)
-            
+
             
     async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
         while True:

@@ -5,13 +5,14 @@ from math import isnan
 
 
 
-def ema(values: List[float], period: int) -> float:
-    if not values: return 0.0
-    k = 2.0 / (period + 1.0)
-    e = values[0]
+def ema(values, period=20):
+    if not values or len(values) < period: return None
+    k = 2/(period+1)
+    out = values[0]
     for v in values[1:]:
-        e = v * k + e * (1.0 - k)
-    return e
+        out = v*k + out*(1-k)
+    return out
+
 
 def rsi(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1: return 50.0

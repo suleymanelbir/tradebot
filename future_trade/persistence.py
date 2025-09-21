@@ -158,42 +158,29 @@ class Persistence:
 
     # --------------------------- Symbol State ---------------------------
 
-    def set_cooldown(self, symbol: str, until_ts: int) -> None:
+    def set_cooldown(self, symbol: str, until_ts: int):
         with self._conn() as c:
             c.execute("""
-              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
-              VALUES(?, '', ?, 0, NULL, NULL, NULL, ?)
-              ON CONFLICT(symbol) DO UPDATE SET cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
-            """, (symbol, int(until_ts), now_ts()))
+            INSERT INTO symbol_state(symbol, cooldown_until, updated_at)
+            VALUES(?, ?, strftime('%s','now'))
+            ON CONFLICT(symbol) DO UPDATE SET cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
+            """, (symbol, until_ts))
             c.commit()
 
     def get_cooldown(self, symbol: str) -> int:
         with self._conn() as c:
-            # Önce kanonik kolona bak
-            cur = c.execute("SELECT cooldown_until_ts FROM symbol_state WHERE symbol=?", (symbol,))
+            cur = c.cursor()
+            cur.execute("SELECT COALESCE(cooldown_until,0) FROM symbol_state WHERE symbol=?", (symbol,))
             row = cur.fetchone()
-            if row and row[0]:
-                return int(row[0])
+            return int(row[0]) if row else 0
 
-            # Geriye dönük uyumluluk: eski kolon varsa ordan oku
-            try:
-                cur = c.execute("SELECT cooldown_until FROM symbol_state WHERE symbol=?", (symbol,))
-                row = cur.fetchone()
-                if row and row[0]:
-                    return int(row[0])
-            except sqlite3.OperationalError:
-                pass
-
-            return 0
-
-    def mark_exit_ts(self, symbol: str, ts: Optional[int] = None) -> None:
-        ts = ts or now_ts()
+    def mark_exit_ts(self, symbol: str, ts: int):
         with self._conn() as c:
             c.execute("""
-              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
-              VALUES(?, '', 0, ?, NULL, NULL, NULL, ?)
-              ON CONFLICT(symbol) DO UPDATE SET last_signal_ts=excluded.last_signal_ts, updated_at=excluded.updated_at
-            """, (symbol, int(ts), now_ts()))
+            INSERT INTO symbol_state(symbol, state, updated_at, last_signal_ts)
+            VALUES(?, 'flat', ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET state='flat', updated_at=?, last_signal_ts=?
+            """, (symbol, ts, ts, ts, ts))
             c.commit()
 
 
