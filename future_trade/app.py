@@ -10,7 +10,9 @@ import json
 import aiohttp
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+import httpx
+import time, hmac, hashlib, logging
+from typing import Dict, Any, Optional
 from .binance_client import BinanceClient
 from .market_stream import MarketStream
 from .strategy.base import StrategyBase, Signal
@@ -203,6 +205,16 @@ async def main() -> None:
     # Portföy ve Risk
     try:
         portfolio = Portfolio(persistence)
+
+        # ✅ ExchangeInfo cache'i Portföy'e ver
+        try:
+            ex_info = await client.exchange_info()
+            portfolio.exchange_info_cache = ex_info  # RiskManager bu cache’i kullanacak
+            logging.info("ExchangeInfo cached (%d symbols)", len(ex_info.get("symbols", [])))
+        except Exception as e:
+            logging.warning(f"exchangeInfo fetch skipped: {e}")
+            portfolio.exchange_info_cache = {"symbols": []}
+
         risk = RiskManager(cfg.get("risk", {}), cfg.get("leverage", {}), portfolio)
         logging.info("Portfolio and RiskManager ready")
     except Exception as e:
@@ -213,13 +225,12 @@ async def main() -> None:
     # Market stream
     try:
         stream = MarketStream(
-            cfg=cfg,
-            whitelist=cfg.get("symbols_whitelist", []),
-            indices=["TOTAL3", "USDT.D", "BTC.D"],
-            tf_entry=cfg.get("strategy", {}).get("timeframe_entry", "1h"),
-            tf_confirm=cfg.get("strategy", {}).get("confirm_tf", "4h"),
-            persistence=persistence,
-            client=client,
+        cfg=cfg,
+        whitelist=cfg["symbols_whitelist"],
+        indices=["TOTAL3", "USDT.D", "BTC.D"],
+        tf_entry=cfg["strategy"]["timeframe_entry"],
+        tf_confirm=cfg["strategy"]["confirm_tf"],
+        persistence=persistence,
         )
         logging.info("MarketStream initialized")
     except Exception as e:

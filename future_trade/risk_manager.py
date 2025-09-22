@@ -28,7 +28,6 @@ class RiskManager:
 
     # risk_manager.py -- plan_trade() yeniden
     def plan_trade(self, symbol: str, signal) -> TradePlan:
-        # 1) Basit giriş/SL/TP (ileride gerçek hesapla değiştireceğiz)
         entry = 100.0
         sl    = 98.0 if signal.side == "LONG" else 102.0
         tp    = 103.0 if signal.side == "LONG" else 97.0
@@ -37,25 +36,20 @@ class RiskManager:
         if dist <= 0:
             return TradePlan(ok=False, reason="invalid stop distance")
 
-        # 2) Risk bazlı qty
         equity  = self.portfolio.equity()
         per_pct = float(self.cfg.get("per_trade_risk_pct", 0.5)) / 100.0
         risk_cap = equity * per_pct
         raw_qty = risk_cap / dist
 
-        # 3) Borsa filtreleri → step/tick/minNotional
-        try:
-            ex_info = getattr(self.portfolio, "exchange_info_cache", None) or {}
-            tick, step, min_notional = symbol_filters(ex_info, symbol)
-        except Exception:
-            tick, step, min_notional = 0.01, 0.001, 5.0
+        # EXCHANGE FILTERS (cache’ten)
+        ex_info = getattr(self.portfolio, "exchange_info_cache", {}) or {}
+        tick, step, min_notional = symbol_filters(ex_info, symbol)
 
         qty = max(quantize(raw_qty, step), step)
         q_entry = price_quantize(entry, tick)
         q_sl    = price_quantize(sl, tick)
         q_tp    = price_quantize(tp, tick)
 
-        # 4) Min notional kontrolü
         notional = q_entry * qty
         buf = float(self.cfg.get("min_notional_buffer", 1.1))
         if notional < (min_notional * buf):
@@ -65,5 +59,5 @@ class RiskManager:
             if notional < min_notional:
                 return TradePlan(ok=False, reason="below_min_notional")
 
-        return TradePlan(ok=True, symbol=symbol, side=signal.side, entry=q_entry, qty=qty, sl=q_sl, tp=q_tp)
-
+        return TradePlan(ok=True, symbol=symbol, side=signal.side,
+                        entry=q_entry, qty=qty, sl=q_sl, tp=q_tp)

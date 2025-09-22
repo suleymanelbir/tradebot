@@ -1,31 +1,22 @@
-"""Piyasa akışı ve kline üretimi (1H/4H):
-- Binance klines (whitelist semboller) + endeksler (TOTAL3/USDT.D/BTC.D) için kaynak
-- Şimdilik placeholder: REST poll ile kapanan mumları periyodik çek (WS TODO)
+# /opt/tradebot/future_trade/market_stream.py
+"""
+Piyasa akışı (paper/dummy) ve endeks snapshot:
+- Her 60 sn: whitelist semboller için kapanmış bar (bar_closed) üretir (close + ema20)
+- TOTAL3 / USDT.D / BTC.D snapshot'ını (mümkünse) global_data.db'den çeker
 - events(): bar_closed event'lerini async generator ile yayımlar
 """
-from __future__ import annotations  # Gelecekteki tip ipuçları için (Python 3.7+)
+from __future__ import annotations
 
-# Standart kütüphaneler
 import asyncio
 import logging
+import random
 import sqlite3
 import time
-
 from collections import deque
-import random
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 
-# Tip tanımları
-from typing import Dict, Any, List, AsyncGenerator, TYPE_CHECKING
-
-# Sadece type-check sırasında import edilir (döngüsel importları önler)
-if TYPE_CHECKING:
-    from .binance_client import BinanceClient
-
-# Dahili modüller
-from .strategy.indicators import ema
-
-# Global DB'deki sembol isimleri
+# Global DB'deki endeks sembolleri
 INDEX_MAP = {
     "TOTAL3": "CRYPTOCAP:TOTAL3",
     "USDT.D": "CRYPTOCAP:USDT.D",
@@ -41,8 +32,7 @@ class MarketStream:
         indices: List[str],
         tf_entry: str,
         tf_confirm: str,
-        persistence,
-        client: "BinanceClient",   # type hint (forward)
+        persistence,  # şimdilik kullanılmıyor; gelecekte klines cache için kullanılabilir
     ):
         self.cfg = cfg
         self.whitelist = whitelist
@@ -50,154 +40,165 @@ class MarketStream:
         self.tf_entry = tf_entry
         self.tf_confirm = tf_confirm
         self.persistence = persistence
-        self.client = client                     # <<< ÖNEMLİ: sınıf alanı
-        self._q: asyncio.Queue = asyncio.Queue() # event kuyruğu
-        self._indices_cache: Dict[str, Any] = {} # TOTAL3/USDT.D/BTC.D snapshot
+
+        self._q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._indices_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Paper fiyat simülasyonu için kısa history (EMA20 hesabı)
+        self._series: Dict[str, deque] = {sym: deque(maxlen=200) for sym in whitelist}
         self._last_prices: Dict[str, float] = {}
-        self.global_db = self.cfg.get("global_db_path", "/opt/tradebot/veritabani/global_data.db")
-        self._series: Dict[str, deque] = {sym: deque(maxlen=100) for sym in whitelist}
 
+        # Global endeks DB yolu (varsa)
+        self.global_db: str = self.cfg.get("global_db_path", "/opt/tradebot/veritabani/global_data.db")
 
-    async def _fetch_1h_bars(self, symbol: str, limit: int = 150):
-        kl = await self.client.get_klines(symbol, interval="1h", limit=limit)  # <<< self.client
-        highs = [float(x[2]) for x in kl]
-        lows  = [float(x[3]) for x in kl]
-        closes= [float(x[4]) for x in kl]
-        close_time = int(kl[-2][6]) // 1000 if len(kl) >= 2 else int(kl[-1][6]) // 1000
-        last_closed_close = float(kl[-2][4]) if len(kl) >= 2 else float(kl[-1][4])
-        return {"highs": highs, "lows": lows, "closes": closes, "t": close_time, "last_close": last_closed_close}
+        # Başlangıç fiyatlarını sabitle (paper)
+        base = float(self.cfg.get("paper_base_price", 100.0))
+        for s in self.whitelist:
+            # Her sembole hafif farklı başlangıç
+            self._series[s].append(base + random.uniform(-2.0, 2.0))
+            self._last_prices[s] = self._series[s][-1]
+
+    # ------- Basit yardımcılar -------
+
+    @staticmethod
+    def _ema(values: List[float], period: int = 20) -> Optional[float]:
+        if not values or len(values) < period:
+            return None
+        k = 2.0 / (period + 1.0)
+        e = values[0]
+        for v in values[1:]:
+            e = v * k + e * (1.0 - k)
+        return e
 
     @staticmethod
     def _bucketize_last_close(rows: List[tuple], bucket_sec: int) -> List[float]:
         """
-        rows: [(ts:int seconds), price:float] — zamana göre kovalayıp her kovadaki son close'u alır.
-        bucket_sec: 3600 (1H) ya da 14400 (4H)
+        rows: [(ts:int seconds), price:float]
+        Zamanı bucket_sec (1H=3600, 4H=14400) aralıklarına kova'layıp, her kovadaki **son** close'u alır.
         """
         if not rows:
             return []
-        seen = {}
+        seen: Dict[int, float] = {}
         for ts, price in rows:
             b = int(ts) // bucket_sec
-            # Aynı kovaya daha geç gelen değer, 'son kapanış' sayılır
-            seen[b] = float(price)
+            seen[b] = float(price)  # aynı kovaya gelen daha geç kayıt 'son' kabul edilir
         buckets = sorted(seen.keys())
         return [seen[b] for b in buckets]
 
     def _refresh_indices(self) -> None:
         """
-        Global DB'den (global_live_data) son verileri okuyup
-        TOTAL3 / USDT.D / BTC.D için 1H ve 4H 'close' ve EMA20 hesaplar.
-        Sonuçları self._indices_cache'e yazar.
+        global_data.db varsa, TOTAL3/USDT.D/BTC.D için 1H ve 4H close + EMA20 hesapla.
+        Yoksa dummy snapshot bırak.
         """
         path = self.global_db
         try:
-            conn = sqlite3.connect(path, timeout=3)
+            conn = sqlite3.connect(path, timeout=2)
             cur = conn.cursor()
-            # Her indeks için son ~2000 satır al (fazlası varsa yeter)
             limit = 2000
-            out = {}
+            out: Dict[str, Dict[str, Any]] = {}
             for k, db_sym in INDEX_MAP.items():
-                cur.execute(
-                    """
-                    SELECT CAST(strftime('%s', timestamp) AS INTEGER) AS ts, live_price
-                    FROM global_live_data
-                    WHERE symbol = ?
-                    ORDER BY ts DESC
-                    LIMIT ?
-                    """,
-                    (db_sym, limit),
-                )
-                rows = cur.fetchall()
+                # yoksa atla
+                try:
+                    cur.execute(
+                        """
+                        SELECT CAST(strftime('%s', timestamp) AS INTEGER) AS ts, live_price
+                        FROM global_live_data
+                        WHERE symbol = ?
+                        ORDER BY ts DESC
+                        LIMIT ?
+                        """,
+                        (db_sym, limit),
+                    )
+                    rows = cur.fetchall()
+                except Exception:
+                    rows = []
+
                 if not rows:
-                    out[k] = {"tf1h": {}, "tf4h": {}}
+                    out[k] = {"tf1h": {"close": 0.0, "ema20": None}, "tf4h": {"close": 0.0, "ema20": None}}
                     continue
 
-                # Saatlik ve 4 saatlik son 'close' serileri
                 closes_1h = self._bucketize_last_close(rows, 3600)
                 closes_4h = self._bucketize_last_close(rows, 14400)
 
-                # En az 20 örnek varsa EMA20 hesapla
-                ema20_1h = ema(closes_1h[-60:], 20) if len(closes_1h) >= 20 else None
-                ema20_4h = ema(closes_4h[-60:], 20) if len(closes_4h) >= 20 else None
+                last_1h = closes_1h[-1] if closes_1h else 0.0
+                last_4h = closes_4h[-1] if closes_4h else 0.0
+                ema20_1h = self._ema(closes_1h[-60:], 20) if len(closes_1h) >= 20 else None
+                ema20_4h = self._ema(closes_4h[-60:], 20) if len(closes_4h) >= 20 else None
 
-                last_1h = closes_1h[-1] if closes_1h else None
-                last_4h = closes_4h[-1] if closes_4h else None
+                out[k] = {"tf1h": {"close": last_1h, "ema20": ema20_1h},
+                          "tf4h": {"close": last_4h, "ema20": ema20_4h}}
 
-                out[k] = {
-                    "tf1h": {"close": last_1h, "ema20": ema20_1h},
-                    "tf4h": {"close": last_4h, "ema20": ema20_4h},
-                }
             self._indices_cache = out
+
         except Exception as e:
+            # Dosya yoksa veya tablo yoksa uyar, dummy snapshot'a düş
             logging.warning(f"indices refresh failed: {e}")
+            self._indices_cache = {
+                "TOTAL3": {"tf1h": {"close": 0.0, "ema20": None}, "tf4h": {"close": 0.0, "ema20": None}},
+                "USDT.D": {"tf1h": {"close": 0.0, "ema20": None}},
+                "BTC.D":  {"tf1h": {"close": 0.0, "ema20": None}},
+            }
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def get_last_price(self, symbol: str):
-        return self._last_prices.get(symbol)
-
-    def _mock_price(self, sym: str, now: int) -> float:
-        # çok basit bir salınım: 100 etrafında +/- 5
+    def _mock_step(self, symbol: str, now: int) -> float:
+        """
+        Paper fiyat üretimi: küçük random yürüme + sinüs dalgası.
+        """
         import math
-        base = 100.0
-        return base + 5.0 * math.sin(now / 60.0)  # ~1 dakikada bir salınsın
+        last = self._last_prices.get(symbol, 100.0)
+        drift = random.uniform(-0.3, 0.3)
+        wave = 0.8 * math.sin(now / 90.0)  # ~1.5 dakikalık dalga
+        nxt = max(1e-6, last + drift + wave * 0.1)
+        return float(nxt)
 
-    def _ema(self, values, period=20):
-        if not values or len(values) < period:
-            return 0.0  # Yetersiz veri varsa None yerine güvenli varsayılan
-        k = 2 / (period + 1)
-        ema = values[0]
-        for v in values[1:]:
-            ema = v * k + ema * (1 - k)
-        return ema
-
-
+    # ------- Dış API -------
 
     async def run(self):
-        tick = 0
-        poll_sec = 60
+        poll_sec = int(self.cfg.get("paper_poll_seconds", 60))
+        ema_period = int(self.cfg.get("strategy", {}).get("params", {}).get("ema_period", 20))
+
         while True:
             try:
                 now = int(time.time())
-                base = getattr(self, "_base_price", 100.0)
 
+                # 1) Her sembol için bir kapanış oluştur → EMA20 hesapla → event sıraya at
                 for sym in self.whitelist:
-                    # küçük gürültü ile fiyat salla (paper için yeterli)
-                    base += random.uniform(-0.5, 0.5)
-                    self._series[sym].append(base)
+                    close = self._mock_step(sym, now)
+                    self._series[sym].append(close)
+                    self._last_prices[sym] = close
 
-                    # EMA hesapla (son 20 bar üzerinden)
-                    ema20 = self._ema(list(self._series[sym]), 20)
+                    ema20 = self._ema(list(self._series[sym]), ema_period)
 
-                    # bar_closed event oluştur
                     event = {
                         "type": "bar_closed",
                         "symbol": sym,
                         "tf": self.tf_entry,
-                        "close": base,
+                        "close": close,
                         "ema20": ema20,
-                        "time": now
+                        "time": now,
                     }
-                    self._last_prices[sym] = base
                     await self._q.put(event)
 
-                # 🔄 Endeks snapshot: global_data.db'den gerçek veriyi çek
+                # 2) Endeks snapshot güncelle (opsiyonel global DB)
                 self._refresh_indices()
 
-                tick += 1
             except Exception as e:
                 logging.error(f"stream error: {e}")
+
             await asyncio.sleep(poll_sec)
 
-            
     async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
         while True:
-            ev = await self._q.get(); yield ev
-
+            ev = await self._q.get()
+            yield ev
 
     def indices_snapshot(self) -> Dict[str, Any]:
-        # Strateji tarafına kopya (mutasyon olmaz)
+        # Strateji tarafına kopya verelim (yan etkisiz)
         return dict(self._indices_cache)
+
+    def get_last_price(self, symbol: str) -> Optional[float]:
+        return self._last_prices.get(symbol)

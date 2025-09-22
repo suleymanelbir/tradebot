@@ -9,6 +9,21 @@ from typing import Dict, Any, Optional, List
 import httpx
 from urllib.parse import urlencode
 
+
+
+def _paper_filters_for(symbol: str) -> dict:
+    # Basit ve güvenli varsayılanlar; istersen sembol bazında özel değerler koyabilirsin
+    return {
+        "symbol": symbol,
+        "status": "TRADING",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE",    "stepSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL","notional": "5"}
+        ]
+    }
+
+
 class BinanceClient:
     def __init__(self, cfg: dict, mode: str = "testnet"):
         self.mode  = (mode or "testnet").lower()
@@ -32,14 +47,15 @@ class BinanceClient:
         # HTTP client (yalnızca ağ açıkken)
         self._client: Optional[httpx.AsyncClient] = None
         if not self.paper:
-            # httpx.Timeout: ya default ver ya dört alanı birlikte ver → dört alanı veriyoruz
             timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=15.0)
             self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
         masked = f"{self.key[:4]}...{self.key[-4:]}" if self.key else "<empty>"
         logging.info("[BINANCE] mode=%s base_url=%s key=%s recvWindow=%s",
-                     self.mode, self.base_url, masked, self.recv)
+                    self.mode, self.base_url, masked, self.recv)
+
         if self.paper:
+            self._paper_network_disabled = True  # ✅ Ağ devre dışı bayrağı
             logging.info("[BINANCE] PAPER MODE: network disabled; all requests are stubbed")
 
     # -------------------- yardımcılar --------------------
@@ -106,11 +122,30 @@ class BinanceClient:
             ][:limit]
         return await self._public("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
-    async def get_exchange_info(self):
-        if self.paper:
-            # Minimal sembol filtresi (gerekirse genişletilir)
-            return {"symbols": []}
-        return await self._public("GET", "/fapi/v1/exchangeInfo")
+    async def exchange_info(self) -> Dict[str, Any]:
+        # PAPER modda ağ kapalı; whitelist için sentetik exchangeInfo dön
+        if self.base and "binancefuture.com" not in self.base and "binance.com" not in self.base:
+            # Eğer paper modda base_url’i boş ya da farklı tutuyorsan; ama en garantisi flag kontrolü:
+            pass
+
+        # PAPER kip kontrolü (senin init’te ‘mode’ bilgisi yoksa bir bayrak ekleyebilirsin)
+        # Kolay çözüm: “PAPER MODE: network disabled...” log’unu basıyorsun; onu bayrak olarak sakladıysan kontrol et.
+        try:
+            # “network disabled” ise sentetik dön
+            # self._network_disabled gibi bir bayrak kullanıyorsan:
+            if getattr(self, "_paper_network_disabled", False):
+                from pathlib import Path
+                # whitelist’i config’ten app içinde biliyoruz; burada bilmiyorsak generic örnek:
+                syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+                return {"symbols": [_paper_filters_for(s) for s in syms]}
+        except Exception:
+            pass
+
+        # Normal modda gerçek endpoint
+        r = await self._client.get("/fapi/v1/exchangeInfo")
+        r.raise_for_status()
+        return r.json()
+
 
     # -------------------- private/signed uçlar (stub destekli) --------------------
     async def get_account(self) -> dict:

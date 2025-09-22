@@ -158,29 +158,29 @@ class Persistence:
 
     # --------------------------- Symbol State ---------------------------
 
-    def set_cooldown(self, symbol: str, until_ts: int):
+    def set_cooldown(self, symbol: str, until_ts: int) -> None:
         with self._conn() as c:
             c.execute("""
             INSERT INTO symbol_state(symbol, cooldown_until, updated_at)
-            VALUES(?, ?, strftime('%s','now'))
+            VALUES(?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
-            """, (symbol, until_ts))
+            """, (symbol, int(until_ts), int(time.time())))
             c.commit()
 
     def get_cooldown(self, symbol: str) -> int:
         with self._conn() as c:
             cur = c.cursor()
-            cur.execute("SELECT COALESCE(cooldown_until,0) FROM symbol_state WHERE symbol=?", (symbol,))
+            cur.execute("SELECT cooldown_until FROM symbol_state WHERE symbol=?", (symbol,))
             row = cur.fetchone()
-            return int(row[0]) if row else 0
+            return int(row[0]) if row and row[0] is not None else 0
 
-    def mark_exit_ts(self, symbol: str, ts: int):
+    def mark_exit_ts(self, symbol: str, ts: int) -> None:
         with self._conn() as c:
             c.execute("""
-            INSERT INTO symbol_state(symbol, state, updated_at, last_signal_ts)
-            VALUES(?, 'flat', ?, ?)
-            ON CONFLICT(symbol) DO UPDATE SET state='flat', updated_at=?, last_signal_ts=?
-            """, (symbol, ts, ts, ts, ts))
+            INSERT INTO symbol_state(symbol, last_signal_ts, updated_at)
+            VALUES(?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET last_signal_ts=excluded.last_signal_ts, updated_at=excluded.updated_at
+            """, (symbol, int(ts), int(time.time())))
             c.commit()
 
 
