@@ -12,6 +12,8 @@ import logging
 import random
 import sqlite3
 import time
+import math
+
 from collections import deque
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -173,14 +175,14 @@ class MarketStream:
 
                     ema20 = self._ema(list(self._series[sym]), ema_period)
 
-                    event = {
-                        "type": "bar_closed",
-                        "symbol": sym,
-                        "tf": self.tf_entry,
-                        "close": close,
-                        "ema20": ema20,
-                        "time": now,
-                    }
+                    # en üste: import math, random
+                    # sınıfta: self._base = {s: 100.0 for s in self.whitelist}
+                    # run() içinde, her sembol için:
+                    b = self._base[sym]
+                    b += random.uniform(-0.6, 0.6) + 0.3*math.sin(now/90.0)
+                    self._base[sym] = b
+                    event = {"type": "bar_closed", "symbol": sym, "tf": self.tf_entry, "close": b, "time": now}
+
                     await self._q.put(event)
 
                 # 2) Endeks snapshot güncelle (opsiyonel global DB)

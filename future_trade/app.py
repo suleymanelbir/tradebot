@@ -256,7 +256,14 @@ async def main() -> None:
         router_cfg.setdefault("leverage", cfg.get("leverage", {}))
 
         router = OrderRouter(client=client, cfg=router_cfg, notifier=notifier, persistence=persistence)
-        reconciler = OrderReconciler(client=client, persistence=persistence, notifier=notifier)
+        # stream.get_last_price'ı reconciler'a enjekte et
+        reconciler = OrderReconciler(
+            client=client,
+            persistence=persistence,
+            notifier=notifier,
+            price_provider=lambda s: stream.get_last_price(s),
+        )
+
         supervisor = PositionSupervisor(cfg, portfolio, notifier, persistence)
         logging.info("OrderRouter, Reconciler, Supervisor ready")
     except Exception as e:
