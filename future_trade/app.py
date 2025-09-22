@@ -216,6 +216,7 @@ async def main() -> None:
             portfolio.exchange_info_cache = {"symbols": []}
 
         risk = RiskManager(cfg.get("risk", {}), cfg.get("leverage", {}), portfolio)
+        risk.bind_order_cfg(cfg.get("order", {}))  # <<< eklendi
         logging.info("Portfolio and RiskManager ready")
     except Exception as e:
         logging.error(f"Portfolio/RiskManager init failed: {e}")
