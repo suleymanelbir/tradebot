@@ -4,6 +4,7 @@
 """
 import sqlite3, json, time, logging
 from typing import Any, Dict, Optional, Iterable, List
+from .order_router import OrderRouter
 
 def now_ts() -> int:
     return int(time.time())
@@ -93,8 +94,10 @@ PRAGMAS = [
 ]
 
 class Persistence:
-    def __init__(self, path: str):
+    def __init__(self, path: str, router: OrderRouter, logger):
         self.path = path
+        self.router = router
+        self.logger = logger
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -244,16 +247,46 @@ class Persistence:
             cur = c.execute("SELECT * FROM futures_positions WHERE ABS(qty) > 0 ORDER BY updated_at DESC")
             return [dict(r) for r in cur.fetchall()]
 
-    def close_position(self, symbol: str) -> None:
+    def get_open_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._conn() as c:
-            c.execute("UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?", (now_ts(), symbol))
-            # state dokun: en azından updated_at güncellensin
-            c.execute("""
-              INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
-              VALUES(?, COALESCE((SELECT state FROM symbol_state WHERE symbol=?), ''), 0, COALESCE((SELECT last_signal_ts FROM symbol_state WHERE symbol=?), 0), NULL, NULL, NULL, ?)
-              ON CONFLICT(symbol) DO UPDATE SET updated_at=excluded.updated_at
-            """, (symbol, symbol, symbol, now_ts()))
-            c.commit()
+            c.row_factory = sqlite3.Row
+            cur = c.cursor()
+            cur.execute("SELECT side, qty FROM futures_positions WHERE symbol=? AND ABS(qty) > 0", (symbol,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+
+    def close_position(self, symbol: str) -> None:
+        """
+        Pozisyonu router üzerinden kapat, ardından deftere yaz.
+        """
+        pos = self.get_open_position(symbol)
+        if not pos:
+            self.logger.info(f"[PERSISTENCE] {symbol} için açık pozisyon yok")
+            return
+
+        qty = abs(float(pos["qty"]))
+        side = "SELL" if pos["side"].upper() == "LONG" else "BUY"
+
+        try:
+            # 1) Router üzerinden pozisyonu kapat
+            self.router.close_position_market(symbol=symbol, side=side, qty=qty, tag="persist_close")
+            self.logger.info(f"[PERSISTENCE] Router ile pozisyon kapatıldı: {symbol} {side} {qty}")
+
+            # 2) Veritabanında pozisyonu sıfırla ve sembol durumunu güncelle
+            with self._conn() as c:
+                c.execute("UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?", (now_ts(), symbol))
+                c.execute("""
+                INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
+                VALUES(?, COALESCE((SELECT state FROM symbol_state WHERE symbol=?), ''), 0, COALESCE((SELECT last_signal_ts FROM symbol_state WHERE symbol=?), 0), NULL, NULL, NULL, ?)
+                ON CONFLICT(symbol) DO UPDATE SET updated_at=excluded.updated_at
+                """, (symbol, symbol, symbol, now_ts()))
+                c.commit()
+
+        except Exception as e:
+            self.logger.error(f"[PERSISTENCE] Pozisyon kapama hatası: {symbol} {e}")
+
 
     def list_open_positions(self) -> List[Dict[str, Any]]:
         with self._conn() as c:

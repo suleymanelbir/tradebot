@@ -8,7 +8,7 @@ import time, hmac, hashlib, logging
 from typing import Dict, Any, Optional, List
 import httpx
 from urllib.parse import urlencode
-
+import asyncio
 
 
 def _paper_filters_for(symbol: str) -> dict:
@@ -222,6 +222,34 @@ class BinanceClient:
             return {"paper": True, "symbol": symbol, **kwargs}
         p = {"symbol": symbol}; p.update(kwargs)
         return await self._signed("GET", "/fapi/v1/order", p)
+    
+    def new_order(self, **kwargs):
+        """
+        Sync wrapper: async new_order varsa onu çağırır.
+        """
+        async_impl = getattr(self, "async_new_order", None)
+        if async_impl is None:
+            # Bazı client'larda method adı doğrudan async cancel_order/new_order olabilir.
+            async_impl = getattr(self, "new_order_async", None)
+        if async_impl is None:
+            # Son çare: new_order zaten sync ise doğrudan çağır.
+            meth = getattr(self, "_new_order_sync_impl", None)
+            if meth:
+                return meth(**kwargs)
+            # Eğer gerçekten async tanımın 'new_order' ise ve biz buraya geldiysek:
+            raise AttributeError("async_new_order / new_order_async bulunamadı, sync impl da yok")
+
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        if loop.is_running():
+            raise RuntimeError("Event loop zaten çalışıyor. Router'ı async bağlamda çağır ya da sync wrapper'ı dışarıdan kullanma.")
+        return loop.run_until_complete(async_impl(**kwargs))
+
+    
 
     async def open_orders(self, symbol: str):
         if self.paper:
