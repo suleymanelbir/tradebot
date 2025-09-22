@@ -1,18 +1,30 @@
 # /opt/tradebot/future_trade/app.py
+
+# 🔮 Geleceğe dönük tip ipuçları (Python 3.7–3.9 uyumu için)
 from __future__ import annotations
-import time
+
+# 🧠 Standart kütüphaneler
 import asyncio
+import contextlib
+import hmac
+import hashlib
+import json
 import logging
 import os
 import signal
-import contextlib
-import json
+import time
+
+# 📦 Harici kütüphaneler
 import aiohttp
-from pathlib import Path
-from typing import Any, Dict, Optional
 import httpx
-import time, hmac, hashlib, logging
-from typing import Dict, Any, Optional
+
+# 📁 Yol ve dosya işlemleri
+from pathlib import Path
+
+# 🧮 Tip ipuçları
+from typing import Any, Dict, Optional
+
+# 🧱 Yerel modüller (future_trade içinden)
 from .binance_client import BinanceClient
 from .market_stream import MarketStream
 from .strategy.base import StrategyBase, Signal
@@ -26,8 +38,9 @@ from .persistence import Persistence
 from .telegram_notifier import Notifier
 
 
+
 # Varsayılan config yolu: future_trade/config.json
-CONFIG_PATH = Path(__file__).with_name("config.json")
+CONFIG_PATH = Path("/opt/tradebot/future_trade/config.json")
 
 # Strateji kayıt defteri
 STRATEGY_REGISTRY: Dict[str, type[StrategyBase]] = {
@@ -182,7 +195,11 @@ async def main() -> None:
 
     # DB
     try:
-        persistence = Persistence(cfg["database"]["path"])
+        persistence = Persistence(
+            path=cfg["database"]["path"],
+            router=None,  # henüz tanımlı değilse geçici olarak None
+            logger=logging.getLogger("db")
+        )
         persistence.init_schema()
         await notifier.info_trades({"event": "startup", "msg": "✅ Database schema OK"})
         logging.info("Database schema initialized")
