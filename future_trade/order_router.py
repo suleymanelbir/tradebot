@@ -1,475 +1,296 @@
-"""Emir gönderme ve koruma (SL/TP/trailing) yönetimi
-- place_entry_with_protection(plan): entry + SL/TP
-- update_trailing_for_open_positions(...): açık pozisyonlar için SL güncelle
-"""
 # /opt/tradebot/future_trade/order_router.py
-from __future__ import annotations  # Tip ipuçları için (Python 3.7+ sonrası)
+"""
+Paper emir yönlendirici:
+- place_entry_with_protection(plan): MARKET entry'yi anında 'FILLED' simüle eder, SL/TP sanal emirleri DB'ye yazar.
+- update_trailing_for_open_positions(stream, trailing_cfg): açık pozisyonlar için trail_stop'u günceller ve SL sanal emrini 'yenile' mantığını uygular.
+Notlar:
+- Gerçekte Binance çağrıları yok; tüm hareketler futures_data.db üzerinde gerçekleşir.
+- ONE_WAY per symbol varsayımı: aynı sembolde tek yön açık kabul edilir (long ya da short).
+"""
 
-# 📦 Standart Kütüphaneler
+from __future__ import annotations
+from typing import Dict, Any, Optional
 import time
 import math
 import logging
-import uuid
-import httpx
+import sqlite3
 
-# 🧠 Tip Tanımları
-from typing import Dict, Any, List, Optional
 
-# 🛠️ Proje İçi Modüller
-from .exchange_utils import quantize, price_quantize, symbol_filters
-from .strategy.indicators import atr  # ATR hesaplamak için
-from .exchange_utils import quantize, price_quantize, symbol_filters
-from .trailing_stop import percent_trailing
-from .persistence import Persistence
+def _now() -> int:
+    return int(time.time())
 
 
 class OrderRouter:
     def __init__(self, client, cfg: Dict[str, Any], notifier, persistence):
         self.client = client
-        self.cfg = cfg
+        self.cfg = cfg or {}
         self.notifier = notifier
         self.persistence = persistence
-       
-        
-    async def _exi(self):
-        if self._exi_cache is None:
-            try:
-                # İSİM BİRLİĞİ: binance_client.exchange_info()
-                self._exi_cache = await self.client.exchange_info()
-                logging.info("exchangeInfo cached")
-            except Exception as e:
-                logging.warning(f"exchangeInfo fetch failed: {e}")
-                self._exi_cache = {"symbols": []}
-        return self._exi_cache
 
+        # Config kısayolları
+        self.entry_type = self.cfg.get("entry", "MARKET")
+        self.tp_mode = self.cfg.get("tp_mode", "limit")
+        self.sl_working_type = self.cfg.get("sl_working_type", "MARK_PRICE")
+        self.tif = self.cfg.get("time_in_force", "GTC")
+        self.reduce_only_prot = bool(self.cfg.get("reduce_only_protection", True))
 
-    def _cid(self, prefix: str) -> str:
-        # 24h içinde benzersiz: ms timestamp + kısa uuid
-        return f"{prefix}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    # --- DB yardımcıları -----------------------------------------------------
 
-    async def _place_idempotent(self, params: dict, stage: str) -> dict:
-        try:
-            return await self.client.place_order(**params)
-        except Exception as e:
-            resp = getattr(e, "response", None)
-            body = (resp.text or "") if resp is not None else ""
-            if "ClientOrderId is duplicated" in body or "-4116" in body:
-                # zaten aynı CID ile bir emir var → onu çek
-                try:
-                    od = await self.client.get_order(
-                        symbol=params["symbol"],
-                        origClientOrderId=params.get("newClientOrderId")
-                    )
-                    logging.info(f"idempotent-ok {stage} {params['symbol']} cid={params.get('newClientOrderId')} -> #{od.get('orderId')}")
-                    return od
-                except Exception as e2:
-                    logging.warning(f"idempotent-lookup-failed {stage}: {e2}; proceeding as placed")
-                    # En kötü ihtimalle devam (Router üst katmanda bir sonraki sync’te yakalar)
-                    return {"symbol": params["symbol"], "clientOrderId": params.get("newClientOrderId")}
-            raise
+    def _conn(self):
+        return self.persistence._conn()
 
+    def _upsert_position(self, symbol: str, side: str, qty: float, entry_price: float, leverage: int):
+        ts = _now()
+        with self._conn() as c:
+            cur = c.cursor()
+            # ONE_WAY: sembolde tek satır
+            cur.execute(
+                "INSERT INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at) "
+                "VALUES(?,?,?,?,?,0,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET side=excluded.side, qty=excluded.qty, "
+                "entry_price=excluded.entry_price, leverage=excluded.leverage, updated_at=excluded.updated_at;",
+                (symbol, side, float(qty), float(entry_price), int(leverage), ts),
+            )
+            c.commit()
 
+    def _get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            cur = c.cursor()
+            cur.execute("SELECT * FROM futures_positions WHERE symbol=?", (symbol,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def _insert_order(self, client_id: str, symbol: str, side: str, otype: str,
+                      status: str, price: Optional[float], qty: float,
+                      reduce_only: bool, extra: Optional[Dict[str, Any]] = None) -> int:
+        ts = _now()
+        with self._conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO futures_orders(client_id, symbol, side, type, status, price, qty, reduce_only, created_at, updated_at, extra_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    client_id, symbol, side, otype, status,
+                    None if price is None else float(price),
+                    float(qty),
+                    1 if reduce_only else 0,
+                    ts, ts,
+                    None if not extra else str(extra),
+                ),
+            )
+            oid = cur.lastrowid
+            c.commit()
+            return int(oid)
+
+    def _set_symbol_state(self, symbol: str, **fields):
+        # symbol_state: (symbol TEXT PRIMARY KEY, state TEXT, cooldown_until INTEGER, last_signal_ts INTEGER,
+        #                trail_stop REAL, peak REAL, trough REAL, updated_at INTEGER)
+        ts = _now()
+        cols = []
+        vals = []
+        for k, v in fields.items():
+            cols.append(f"{k}=?")
+            vals.append(v)
+        vals.append(ts)
+        set_clause = ", ".join(cols + ["updated_at=?"])
+        with self._conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                f"INSERT INTO symbol_state(symbol, {', '.join(k for k in fields.keys())}, updated_at) "
+                f"VALUES(?, {', '.join('?' for _ in fields)}, ?) "
+                f"ON CONFLICT(symbol) DO UPDATE SET {set_clause};",
+                (symbol, *vals)
+            )
+            c.commit()
+
+    def _get_symbol_state(self, symbol: str) -> Dict[str, Any]:
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            cur = c.cursor()
+            cur.execute("SELECT * FROM symbol_state WHERE symbol=?", (symbol,))
+            row = cur.fetchone()
+            return dict(row) if row else {}
+
+    # --- Paper entry + SL/TP -------------------------------------------------
 
     async def place_entry_with_protection(self, plan):
         """
-        PAPER modda:
-        - futures_positions'a upsert (qty sign: LONG=+, SHORT=-)
-        - trades_bot'a entry/sl/tp 'ack' mesajları
-        Gerçekte:
-        - Binance order gönderilecek (ileride live moda geçince)
+        Plan alanları (RiskManager.TradePlan):
+          - symbol, side, entry, qty, leverage
+          - sl, tp
+          - entry_type, tp_mode, sl_working_type, time_in_force, reduce_only_protection
+        Paper davranış:
+          - Entry MARKET → anında 'FILLED'
+          - SL: STOP_MARKET reduceOnly sanal emri (DB)
+          - TP: 'limit' ise LIMIT reduceOnly sanal emri (DB)
         """
         sym = plan.symbol
         side = plan.side
+        qty = float(plan.qty)
+        entry = float(plan.entry or 0.0)
+        lev = int(plan.leverage or 1)
 
-        # 0) Emir yönleri
-        entry_side = "BUY" if side == "LONG" else "SELL"
-        opp = "SELL" if side == "LONG" else "BUY"
+        # 1) ENTRY (FILLED)
+        entry_cid = f"entry_{_now()}"
+        self._insert_order(
+            client_id=entry_cid,
+            symbol=sym,
+            side=side,
+            otype="MARKET",
+            status="FILLED",
+            price=entry,
+            qty=qty,
+            reduce_only=False,
+            extra={"paper": True},
+        )
+        await self.notifier.trade({"event": "entry", "symbol": sym, "side": side, "qty": qty})
 
-        # 1) Sembol filtreleri → tick/step/min_notional
-        exi = await self.client.exchange_info()
-        tick, step, min_notional = symbol_filters(exi, sym)
+        # 2) POZİSYON (ONE_WAY) — qty işareti
+        signed_qty = qty if side == "LONG" else -qty
+        self._upsert_position(sym, side, signed_qty, entry, lev)
 
-        # 2) Miktar ve fiyatları kademeye oturt
-        qty = max(quantize(float(plan.qty), step), step)
+        # 3) Koruma emirleri (sanal)
+        # SL
+        if plan.sl:
+            # LONG için sl < entry, SHORT için sl > entry olmalı — aksi durumda yazmayalım
+            good = (side == "LONG" and float(plan.sl) < entry) or (side == "SHORT" and float(plan.sl) > entry)
+            if good:
+                sl_side = "SELL" if side == "LONG" else "BUY"
+                sl_cid = f"sl_{_now()}"
+                self._insert_order(
+                    client_id=sl_cid,
+                    symbol=sym,
+                    side=sl_side,
+                    otype="STOP_MARKET",
+                    status="NEW",
+                    price=float(plan.sl),
+                    qty=abs(signed_qty),
+                    reduce_only=True,
+                    extra={"workingType": plan.sl_working_type, "paper": True},
+                )
+                await self.notifier.debug_trades({"event": "sl_ack", "symbol": sym, "orderId": sl_cid, "stop": float(plan.sl)})
 
-        def qprice(p):
-            return price_quantize(float(p), tick) if p is not None else None
+                # symbol_state trail_stop başlangıcı
+                self._set_symbol_state(sym, trail_stop=float(plan.sl))
+        # TP
+        if plan.tp and str(plan.tp_mode).lower() == "limit":
+            tp_side = "SELL" if side == "LONG" else "BUY"
+            tp_cid = f"tp_{_now()}"
+            self._insert_order(
+                client_id=tp_cid,
+                symbol=sym,
+                side=tp_side,
+                otype="LIMIT",
+                status="NEW",
+                price=float(plan.tp),
+                qty=abs(signed_qty),
+                reduce_only=True,
+                extra={"timeInForce": self.tif, "paper": True},
+            )
+            await self.notifier.debug_trades({"event": "tp_ack", "symbol": sym, "orderId": tp_cid, "tp": float(plan.tp)})
 
-        entry = qprice(plan.entry)
-        sl_price = qprice(getattr(plan, "sl", None))
-        tp_price = qprice(getattr(plan, "tp", None))
-
-        # 3) Eski koruma emirlerini iptal et
-        await self._cancel_existing_protections(sym)
-
-        # 4) MARKET entry (idempotent)
-        entry_params = {
-            "symbol": sym,
-            "side": entry_side,
-            "type": "MARKET",
-            "quantity": qty,
-            "newClientOrderId": self._cid("entry"),
-        }
-        try:
-            od_entry = await self._place_idempotent(entry_params, "entry")
-            await self.notifier.debug_trades({
-                "event": "entry_ack",
-                "symbol": sym,
-                "orderId": od_entry.get("orderId"),
-                "qty": qty
-            })
-        except Exception as e:
-            await self.notifier.alert({
-                "event": "order_error",
-                "symbol": sym,
-                "stage": "entry",
-                "error": str(e)
-            })
-            raise
-
-        # 5) STOP (SL) — reduceOnly + closePosition
-        if sl_price:
-            sl_params = {
-                "symbol": sym,
-                "side": opp,
-                "type": "STOP_MARKET",
-                "stopPrice": sl_price,
-                "closePosition": "true",
-                "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                "newClientOrderId": self._cid("sl"),
-            }
-            try:
-                od_sl = await self._place_idempotent(sl_params, "stop")
-                await self.notifier.debug_trades({
-                    "event": "sl_ack",
-                    "symbol": sym,
-                    "orderId": od_sl.get("orderId"),
-                    "stop": sl_price
-                })
-            except Exception as e:
-                await self.notifier.alert({
-                    "event": "order_error",
-                    "symbol": sym,
-                    "stage": "stop",
-                    "error": str(e)
-                })
-
-        # 6) TAKE PROFIT
-        tp_mode = str(self.cfg.get("tp_mode", "MARKET")).upper()
-        if tp_price and tp_mode == "MARKET":
-            tp_params = {
-                "symbol": sym,
-                "side": opp,
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": tp_price,
-                "closePosition": "true",
-                "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                "newClientOrderId": self._cid("tp"),
-            }
-            try:
-                od_tp = await self._place_idempotent(tp_params, "take_profit")
-                await self.notifier.debug_trades({
-                    "event": "tp_ack",
-                    "symbol": sym,
-                    "orderId": od_tp.get("orderId"),
-                    "tp": tp_price
-                })
-            except Exception as e:
-                await self.notifier.alert({
-                    "event": "order_error",
-                    "symbol": sym,
-                    "stage": "take_profit",
-                    "error": str(e)
-                })
-
-        # 7) PAPER modda DB’ye yaz + Telegram bildirimi
-        if self.cfg.get("mode", "PAPER").upper() == "PAPER":
-            await self.notifier.trade({
-                "event": "entry",
-                "symbol": plan.symbol,
-                "side": plan.side,
-                "qty": float(plan.qty)
-            })
-
-            conn = self.persistence._conn()
-            try:
-                cur = conn.cursor()
-                qty_signed = float(plan.qty) if plan.side == "LONG" else -float(plan.qty)
-                cur.execute("""
-                    INSERT OR REPLACE INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 0, ?)
-                """, (
-                    plan.symbol,
-                    plan.side,
-                    qty_signed,
-                    float(plan.entry or 0.0),
-                    1,
-                    int(time.time())
-                ))
-                conn.commit()
-
-                # SL/TP “ack” mesajları (paper)
-                if plan.sl:
-                    await self.notifier.debug_trades({
-                        "event": "sl_ack",
-                        "symbol": plan.symbol,
-                        "stop": plan.sl
-                    })
-                if plan.tp:
-                    await self.notifier.debug_trades({
-                        "event": "tp_ack",
-                        "symbol": plan.symbol,
-                        "tp": plan.tp
-                    })
-            finally:
-                conn.close()
-            
-
-    # 6) (DB tarafı) — Reconciler borsadan okuyacağı için burada ek işlem zorunlu değil.
-
-    async def _effective_leverage(self, symbol: str) -> int:
-        # config: leverage: { "default": 3, "ETHUSDT": 5, ... }
-        lev_cfg = self.cfg.get("leverage", {})
-        return int(lev_cfg.get(symbol, lev_cfg.get("default", 3)))
-
-    async def _cap_qty_by_margin(self, symbol: str, qty: float, entry_ref: float, step: float) -> float:
-        """
-        available USDT ve kaldıraç ile maks. alım gücünü hesapla,
-        adedi step’e yuvarlayıp geri döndür.
-        """
-        lev = await self._effective_leverage(symbol)
-        px  = entry_ref or await self.client.get_price(symbol)
-        avail = await self.client.get_available_usdt()
-        # güvenlik payı
-        safety = float(self.cfg.get("margin_safety", 0.95))
-        max_notional = avail * lev * safety
-        if px <= 0:
-            return qty
-        max_qty = max_notional / px
-        # step’e oturt
-        
-
-        capped = quantize(max_qty, step)
-        return min(qty, max(capped, step))
-
-
-    def _cid(self, prefix: str) -> str:
-        return f"{prefix}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-
-    async def _exi(self):
-        if self._exi_cache is None:
-            try:
-                self._exi_cache = await self.client.get_exchange_info()
-                logging.info("exchangeInfo cached")
-            except Exception as e:
-                logging.warning(f"exchangeInfo fetch failed: {e}")
-                self._exi_cache = {"symbols": []}
-        return self._exi_cache
-
-    async def _current_sl_order(self, symbol: str) -> Optional[dict]:
-        """Açık STOP_MARKET close-all (closePosition=true) SL emrini bul."""
-        try:
-            opens = await self.client.open_orders(symbol)
-        except Exception as e:
-            logging.debug(f"open_orders fail {symbol}: {e}")
-            return None
-        for od in opens:
-            t = od.get("type")
-            cp = str(od.get("closePosition", "")).lower() == "true"
-            if t in ("STOP_MARKET", "STOP") and cp:
-                return od
-        return None
-
-    async def _cancel_order_silent(self, symbol: str, order_id: Optional[int]=None, client_id: Optional[str]=None):
-        try:
-            p = {"symbol": symbol}
-            if order_id: p["orderId"] = order_id
-            if client_id: p["origClientOrderId"] = client_id
-            await self.client.cancel_order(**p)
-        except Exception as e:
-            logging.debug(f"cancel_order_silent {symbol}: {e}")
-
-
-
-    async def _cancel_existing_protections(self, symbol: str):
-        """Sembole ait açık reduceOnly SL/TP emirlerini iptal et (çakışmayı önler)."""
-        try:
-            opens = await self.client.open_orders(symbol)
-        except Exception as e:
-            logging.debug(f"open_orders fail {symbol}: {e}")
-            return
-        prot_types = {"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
-        for od in opens:
-            if od.get("reduceOnly") and od.get("type") in prot_types:
-                try:
-                    await self.client.cancel_order(symbol, orderId=od.get("orderId"))
-                    logging.info(f"cancel protect {symbol} #{od.get('orderId')} type={od.get('type')}")
-                except Exception as ce:
-                    logging.debug(f"cancel protect fail {symbol}: {ce}")
-
-
-  
+    # --- Trailing SL güncelle ------------------------------------------------
 
     async def update_trailing_for_open_positions(self, stream, trailing_cfg: Dict[str, Any]):
         """
-        Gerçek modda:
-        - ATR tabanlı trailing SL güncellemesi
-        - STOP_MARKET closePosition=true ile emir gönderimi
-        PAPER modda:
-        - Basit % trailing hesaplanır (percent_trailing ile)
-        - symbol_state.trail_stop güncellenir
-        - trades_bot'a trailing_updated mesajı gönderilir
+        Basit yüzde bazlı trailing:
+          - trailing_cfg: {"type": "percent", "percent": 2.0} ya da config'teki ATR/chandelier gelecekte eklenecek.
+        Çalışma:
+          - Açık pozisyonları al
+          - Son fiyatı (paper için stream.get_last_price(symbol)) çek
+          - Kâr yönünde trail_stop'u sıkılaştır
+          - SL sanal emrini (DB'de STOP_MARKET satırı) güncellenmiş stopPrice ile "yenile" (DB’de sadece price alanını güncelleriz)
         """
-        now = int(time.time())
-        step_pct = float(trailing_cfg.get("step_pct", 0.1)) / 100.0
-        atr_period = int(trailing_cfg.get("atr_period", 14))
-        atr_mult = float(trailing_cfg.get("atr_mult", 2.0))
+        ttype = trailing_cfg.get("type", "percent").lower()
+        pct = float(trailing_cfg.get("percent", 1.0))
+        if pct <= 0:
+            return
 
-        # Açık pozisyonları çek
-        with self.persistence._conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT symbol, side, qty FROM futures_positions WHERE ABS(qty)>0")
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            cur = c.cursor()
+            cur.execute("SELECT * FROM futures_positions WHERE ABS(qty) > 0")
             rows = cur.fetchall()
 
-        if not rows:
-            return
+        for r in rows:
+            sym = r["symbol"]
+            side = r["side"]
+            qty = float(r["qty"])
+            last = stream.get_last_price(sym)
+            if last is None:
+                continue
 
-        # PAPER mod kontrolü
-        paper_mode = self.cfg.get("mode", "paper").lower() == "paper"
+            st = self._get_symbol_state(sym)
+            prev_trail = st.get("trail_stop")
 
-        if paper_mode:
-            # PAPER mod: percent_trailing ile güncelle
-            conn = self.persistence._conn()
-            try:
-                cur = conn.cursor()
-                for sym, side, qty in rows:
-                    last = stream.get_last_price(sym) or 0.0
-                    if not last:
-                        continue
+            # Yeni trail hesabı (yüzde)
+            new_trail = self._percent_trail(side, last, prev_trail, pct)
 
-                    # Önceki trail_stop'u çek
-                    prev_trail = None
-                    cur.execute("SELECT trail_stop FROM symbol_state WHERE symbol=?", (sym,))
-                    row = cur.fetchone()
-                    if row and row[0] is not None:
-                        prev_trail = float(row[0])
-
-                    pct = float(trailing_cfg.get("step_pct", 0.1))
-                    new_trail = percent_trailing("LONG" if side == "LONG" else "SHORT", last, prev_trail, pct)
-
-                    if new_trail != prev_trail:
-                        cur.execute("""
-                            INSERT INTO symbol_state(symbol, trail_stop, updated_at)
-                            VALUES(?, ?, ?)
-                            ON CONFLICT(symbol) DO UPDATE SET trail_stop=excluded.trail_stop, updated_at=excluded.updated_at
-                        """, (sym, float(new_trail), now))
-                        await self.notifier.debug_trades({
-                            "event": "trailing_updated",
-                            "symbol": sym,
-                            "side": side,
-                            "stop": float(new_trail)
-                        })
-                conn.commit()
-            finally:
-                conn.close()
-            return
-
-        # GERÇEK mod: ATR tabanlı trailing SL
-        exi = await self._exi()
-
-        for sym, side, qty in rows:
-            try:
-                if (side == "LONG" and qty < 0) or (side == "SHORT" and qty > 0):
-                    await self.notifier.alert({
-                        "event": "trailing_mismatch",
-                        "symbol": sym,
-                        "qty": qty,
-                        "side": side,
-                        "error": "Position direction mismatch"
-                    })
+            # Sadece kâr yönünde ve sıkılaştırma yapılır
+            if prev_trail is not None:
+                if side == "LONG" and new_trail <= prev_trail:
+                    continue
+                if side == "SHORT" and new_trail >= prev_trail:
                     continue
 
-                tick, step, _ = symbol_filters(exi, sym)
-                limit = max(atr_period + 3, 25)
-                kl = await self.client.get_klines(sym, interval=stream.tf_entry, limit=limit)
-                if not kl or len(kl) < atr_period + 1:
-                    continue
+            # DB: symbol_state trail_stop güncelle
+            self._set_symbol_state(sym, trail_stop=float(new_trail))
 
-                closes = [float(k[4]) for k in kl]
-                highs = [float(k[2]) for k in kl]
-                lows = [float(k[3]) for k in kl]
+            # DB: SL sanal emrini güncelle (ilk bulunan STOP_MARKET reduceOnly)
+            self._refresh_virtual_sl(sym, side, abs(qty), new_trail)
 
-                atr_val = atr(highs, lows, closes, period=atr_period)
-                if not atr_val or math.isnan(atr_val):
-                    continue
+            await self.notifier.debug_trades({
+                "event": "trailing_updated",
+                "symbol": sym,
+                "side": side,
+                "stop": float(new_trail)
+            })
 
-                last_close = closes[-1]
-                if side == "LONG":
-                    target = last_close - atr_mult * atr_val
-                    opp = "SELL"
-                else:
-                    target = last_close + atr_mult * atr_val
-                    opp = "BUY"
+    def _percent_trail(self, side: str, last_price: float, prev_trail: Optional[float], pct: float) -> float:
+        if prev_trail is None:
+            if side == "LONG":
+                return last_price * (1 - pct / 100.0)
+            else:
+                return last_price * (1 + pct / 100.0)
+        if side == "LONG":
+            return max(prev_trail, last_price * (1 - pct / 100.0))
+        else:
+            return min(prev_trail, last_price * (1 + pct / 100.0))
 
-                target_q = price_quantize(target, tick)
+    def _refresh_virtual_sl(self, symbol: str, side: str, qty_abs: float, new_stop: float) -> None:
+        """
+        futures_orders tablosunda STOP_MARKET reduceOnly emrini bularak price'ını günceller.
+        (Paper: tek bir SL satırı varsayımı; birden fazla ise ilkini günceller.)
+        """
+        with self._conn() as c:
+            c.row_factory = sqlite3.Row
+            cur = c.cursor()
+            cur.execute(
+                "SELECT id FROM futures_orders WHERE symbol=? AND type='STOP_MARKET' AND reduce_only=1 ORDER BY id ASC LIMIT 1",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            if not row:
+                # SL hiç yoksa yeni bir tane ekle (güvenli taraf)
+                sl_side = "SELL" if side == "LONG" else "BUY"
+                self._insert_order(
+                    client_id=f"sl_{_now()}",
+                    symbol=symbol,
+                    side=sl_side,
+                    otype="STOP_MARKET",
+                    status="NEW",
+                    price=float(new_stop),
+                    qty=float(qty_abs),
+                    reduce_only=True,
+                    extra={"paper": True},
+                )
+                return
 
-                cur_sl = await self._current_sl_order(sym)
-                cur_stop = float(cur_sl["stopPrice"]) if cur_sl and cur_sl.get("stopPrice") else None
-
-                should_update = False
-                if cur_stop is None:
-                    should_update = True
-                else:
-                    if side == "LONG":
-                        should_update = target_q > cur_stop * (1.0 + step_pct)
-                    else:
-                        should_update = target_q < cur_stop * (1.0 - step_pct)
-
-                if not should_update:
-                    continue
-
-                if cur_sl:
-                    await self._cancel_order_silent(sym, order_id=cur_sl.get("orderId"))
-
-                sl_params = {
-                    "symbol": sym,
-                    "side": opp,
-                    "type": "STOP_MARKET",
-                    "stopPrice": target_q,
-                    "closePosition": "true",
-                    "workingType": self.cfg.get("sl_working_type", "MARK_PRICE"),
-                    "newClientOrderId": self._cid("trail_sl"),
-                }
-
-                try:
-                    od = await self.client.place_order(**sl_params)
-                    await self.notifier.debug_trades({
-                        "event": "trailing_updated",
-                        "symbol": sym,
-                        "side": side,
-                        "stop": target_q,
-                        "orderId": od.get("orderId"),
-                    })
-                except httpx.HTTPStatusError as e:
-                    body = e.response.text if e.response else ""
-                    await self.notifier.trade({
-                        "event": "trailing_error",
-                        "symbol": sym,
-                        "status": getattr(e.response, "status_code", None),
-                        "binance": body
-                    })
-                    raise
-                except Exception as e:
-                    await self.notifier.trade({
-                        "event": "trailing_error",
-                        "symbol": sym,
-                        "error": str(e)
-                    })
-                    raise
-
-            except Exception as e:
-                await self.notifier.alert({
-                    "event": "trailing_error",
-                    "symbol": sym,
-                    "error": str(e)
-                })
+            oid = int(row["id"])
+            ts = _now()
+            cur.execute(
+                "UPDATE futures_orders SET price=?, updated_at=? WHERE id=?",
+                (float(new_stop), ts, oid),
+            )
+            c.commit()
