@@ -18,11 +18,11 @@ test-func:
 
 # Preflight kontrolünü çalıştırır (live moda geçmeden önce)
 preflight:
-    @echo "🔍 Preflight kontrolü başlatılıyor..."
-    python3 /opt/tradebot/tests/preflight_check.py
+	@echo "🔍 Preflight kontrolü başlatılıyor..."
+	python3 /opt/tradebot/tests/preflight_check.py
 
 # Test loglarını ve önbelleği temizler
 clean:
-    rm -f /opt/tradebot/tests/report.json
-    find /opt/tradebot/tests -name "*.pyc" -delete
-    find /opt/tradebot/tests -name "__pycache__" -type d -exec rm -r {} +
+	rm -f /opt/tradebot/tests/report.json
+	find /opt/tradebot/tests -name "*.pyc" -delete
+	find /opt/tradebot/tests -name "__pycache__" -type d -exec rm -r {} +

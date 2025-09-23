@@ -200,23 +200,24 @@ class MarketStream:
             try:
                 now = int(time.time())
 
-                # 1) Her sembol için bir kapanış oluştur → EMA20 hesapla → event sıraya at
                 for sym in self.whitelist:
-                    # adım
+                    # 1) Mock adım → kapanış serisine ekle
                     close = self._mock_step(sym, now)
                     self._series[sym].append(close)
                     self._last_prices[sym] = close
 
-                    # isteğe bağlı ema hesap (şimdilik kullanılmıyor ama ileride kullanılabilir)
+                    # EMA hesapla (şimdilik kullanılmıyor ama ileride gerekebilir)
                     _ = self._ema(list(self._series[sym]), ema_period)
 
-                    # yumuşak baz yürüyüşü (close'a paralel)
+                    # 2) Basit salınım ekle → fiyatı yumuşak şekilde dalgalandır
                     b = self._base[sym]
                     b += random.uniform(-0.6, 0.6) + 0.3 * math.sin(now / 90.0)
-                    # close değerini bazla harmanlamak istersen küçük ağırlık verebilirsin
-                    blended = 0.8 * close + 0.2 * b
                     self._base[sym] = b
 
+                    # 3) Gerçek kapanış ile baz salınımı harmanla (test için daha gerçekçi)
+                    blended = 0.8 * close + 0.2 * b
+
+                    # 4) Event oluştur ve sıraya at
                     event = {
                         "type": "bar_closed",
                         "symbol": sym,
@@ -226,13 +227,14 @@ class MarketStream:
                     }
                     await self._q.put(event)
 
-                # 2) Endeks snapshot güncelle (opsiyonel global DB)
+                # 5) Endeks snapshot güncelle
                 self._refresh_indices()
 
             except Exception as e:
                 self.logger.error(f"stream error: {e}")
 
             await asyncio.sleep(poll_sec)
+
 
     async def events(self) -> AsyncGenerator[Dict[str, Any], None]:
         """

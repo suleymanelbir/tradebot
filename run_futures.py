@@ -1,3 +1,12 @@
+"""pkill -f "run_futures.py" || true
+    python /opt/tradebot/run_futures.py
+
+chmod +x run_futures.py
+./run_futures.py
+Bu komutla dosya doğrudan çalıştırılır, çünkü shebang satırı Python 3 yorumlayıcısını çağırır.
+"""
+
+
 #!/usr/bin/env python3
 import asyncio
 import sys
