@@ -40,9 +40,11 @@ class BinanceClient:
         if self.mode == "testnet":
             self.base_url = cfg.get("testnet_base_url", "https://testnet.binancefuture.com")
             self.ws_url   = cfg.get("testnet_ws_url",   "wss://stream.binancefuture.com")
+            self.base     = self.base_url
         else:
             self.base_url = cfg.get("base_url", "https://fapi.binance.com")
             self.ws_url   = cfg.get("ws_url",   "wss://fstream.binance.com")
+            self.base     = self.base_url
 
         # HTTP client (yalnızca ağ açıkken)
         self._client: Optional[httpx.AsyncClient] = None

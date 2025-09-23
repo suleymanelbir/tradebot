@@ -245,7 +245,6 @@ async def main() -> None:
         stream = MarketStream(
         cfg=cfg,
         whitelist=cfg["symbols_whitelist"],
-        indices=["TOTAL3", "USDT.D", "BTC.D"],
         tf_entry=cfg["strategy"]["timeframe_entry"],
         tf_confirm=cfg["strategy"]["confirm_tf"],
         persistence=persistence,
