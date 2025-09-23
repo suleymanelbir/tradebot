@@ -10,14 +10,15 @@ import hmac
 import hashlib
 import json
 import logging
+logger = logging.getLogger("TradeBot")
 import os
 import signal
 import time
-
+import contextlib
 # 📦 Harici kütüphaneler
 import aiohttp
 import httpx
-
+import logging
 # 📁 Yol ve dosya işlemleri
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from .portfolio import Portfolio
 from .persistence import Persistence
 from .telegram_notifier import Notifier
 
+from future_trade.order_manager import OrderManager
 
 
 # Varsayılan config yolu: future_trade/config.json
@@ -50,6 +52,7 @@ STRATEGY_REGISTRY: Dict[str, type[StrategyBase]] = {
 
 async def load_config(path: Path) -> Dict[str, Any]:
     """Config dosyasını yükler (utf-8)."""
+    
     text = path.read_text(encoding="utf-8")
     return json.loads(text)
 
@@ -169,6 +172,7 @@ async def send_alert(msg: str):
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logger = logging.getLogger("TradeBot") 
     print("Futures bot starting...")
 
     cfg_path_env = os.environ.get("FUTURE_TRADE_CONFIG")
@@ -210,14 +214,23 @@ async def main() -> None:
 
     # Binance client
     try:
-        client = BinanceClient(cfg["binance"], cfg.get("mode", "testnet"))
-        await client.bootstrap_exchange(cfg)
+        # mode artık app.mode altında; eski config’lerle de uyum için geriye dönük okuma yap
+        app_section = cfg.get("app", {})
+        mode = app_section.get("mode", cfg.get("mode", "paper")).lower()
+
+        client = BinanceClient(cfg["binance"], mode)
+        await client.bootstrap_exchange({
+            "margin_mode": app_section.get("margin_mode", cfg.get("margin_mode", "ISOLATED")),
+            "position_mode": app_section.get("position_mode", cfg.get("position_mode", "ONE_WAY")),
+        })
         await notifier.info_trades({"event": "startup", "msg": "✅ Binance client OK"})
         logging.info("Binance client bootstrapped")
+
     except Exception as e:
         logging.error(f"Binance client failed: {e}")
         await notifier.alert({"event": "startup_error", "msg": f"❌ Binance client failed: {e}"})
         return
+
 
     # Portföy ve Risk
     try:
@@ -244,6 +257,7 @@ async def main() -> None:
     try:
         stream = MarketStream(
         cfg=cfg,
+        logger=logger,
         whitelist=cfg["symbols_whitelist"],
         tf_entry=cfg["strategy"]["timeframe_entry"],
         tf_confirm=cfg["strategy"]["confirm_tf"],
@@ -271,7 +285,21 @@ async def main() -> None:
         router_cfg = dict(cfg.get("order", {}) or {})
         router_cfg.setdefault("leverage", cfg.get("leverage", {}))
 
-        router = OrderRouter(client=client, cfg=router_cfg, notifier=notifier, persistence=persistence)
+        router = OrderRouter(
+            config=router_cfg,
+            binance_client=client,  # ✅ parametre adı düzeltildi
+            normalizer=client.normalizer,  # eğer varsa
+            logger=logger,
+            paper_engine=None,  # veya client.paper_engine
+        )
+
+        # ✅ Trailing bağlamı router'a enjekte et
+        router.attach_trailing_context(
+            get_last_price=stream.get_last_price,
+            list_open_positions=persistence.list_open_positions if hasattr(persistence, "list_open_positions") else lambda: [],
+            upsert_stop=None  # PAPER modda loglar, LIVE modda ileride güncellenebilir
+        )
+
         # stream.get_last_price'ı reconciler'a enjekte et
         reconciler = OrderReconciler(
             client=client,
@@ -329,4 +357,8 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("Bot durduruldu (Ctrl+C)")
+    except Exception as e:
+        import traceback
+        print("Başlatma hatası:", e)
+        traceback.print_exc()

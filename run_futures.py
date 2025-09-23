@@ -15,8 +15,13 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from future_trade.app import main as app_main  # noqa: E402
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(app_main())
     except KeyboardInterrupt:
-        pass
+        print("Bot durduruldu (Ctrl+C)")
+    except Exception as e:
+        import traceback
+        print("Başlatma hatası:", e)
+        traceback.print_exc()

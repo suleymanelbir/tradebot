@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 import httpx
 from urllib.parse import urlencode
 import asyncio
-
+from future_trade.exchange_normalizer import ExchangeNormalizer  # dosyanın başına
 
 def _paper_filters_for(symbol: str) -> dict:
     # Basit ve güvenli varsayılanlar; istersen sembol bazında özel değerler koyabilirsin
@@ -23,41 +23,41 @@ def _paper_filters_for(symbol: str) -> dict:
         ]
     }
 
-
 class BinanceClient:
-    def __init__(self, cfg: dict, mode: str = "testnet"):
-        self.mode  = (mode or "testnet").lower()
+    def __init__(self, cfg: Dict[str, Any], mode: str):
+        self.mode = mode.lower()
         self.paper = (self.mode == "paper")
 
         # API key/secret
-        self.key    = cfg.get("key", "")
+        self.key = cfg.get("key", "")
         self.secret = (cfg.get("secret", "") or "").encode()
+
+        self.normalizer = ExchangeNormalizer(cfg)  
 
         # recvWindow (ms)
         self.recv = int(cfg.get("recv_window_ms", 5000))
 
-        # Baz URL’ler (kayıt için tutuyoruz; paper’da kullanılmayacak)
-        if self.mode == "testnet":
-            self.base_url = cfg.get("testnet_base_url", "https://testnet.binancefuture.com")
-            self.ws_url   = cfg.get("testnet_ws_url",   "wss://stream.binancefuture.com")
-            self.base     = self.base_url
-        else:
-            self.base_url = cfg.get("base_url", "https://fapi.binance.com")
-            self.ws_url   = cfg.get("ws_url",   "wss://fstream.binance.com")
-            self.base     = self.base_url
+        # URL seçimleri (mode’a göre)
+        self.base = cfg.get("base_url", "https://fapi.binance.com")
+        self.ws   = cfg.get("ws_url",   "wss://fstream.binance.com")
+
+        if self.mode in ("paper", "testnet"):
+            self.base = cfg.get("testnet_base_url", self.base)
+            self.ws   = cfg.get("testnet_ws_url",   self.ws)
 
         # HTTP client (yalnızca ağ açıkken)
         self._client: Optional[httpx.AsyncClient] = None
         if not self.paper:
             timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=15.0)
-            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+            self._client = httpx.AsyncClient(base_url=self.base, timeout=timeout)
 
+        # Loglama
         masked = f"{self.key[:4]}...{self.key[-4:]}" if self.key else "<empty>"
-        logging.info("[BINANCE] mode=%s base_url=%s key=%s recvWindow=%s",
-                    self.mode, self.base_url, masked, self.recv)
+        logging.info("[BINANCE] mode=%s base=%s key=%s recvWindow=%s",
+                     self.mode, self.base, masked, self.recv)
 
         if self.paper:
-            self._paper_network_disabled = True  # ✅ Ağ devre dışı bayrağı
+            self._paper_network_disabled = True
             logging.info("[BINANCE] PAPER MODE: network disabled; all requests are stubbed")
 
     # -------------------- yardımcılar --------------------
@@ -275,25 +275,36 @@ class BinanceClient:
         if symbol: p["symbol"] = symbol
         return await self._signed("GET", "/fapi/v2/positionRisk", p)
 
-    async def bootstrap_exchange(self, cfg: dict):
-        """Başlangıç ONE_WAY ve (opsiyon) margin/leverage ayarı."""
+    async def bootstrap_exchange(self, exch_cfg: Dict[str, Any]) -> None:
+        """Başlangıç ONE_WAY ve (opsiyonel) margin/leverage ayarı."""
         if self.paper:
             logging.info("paper: bootstrap_exchange skipped")
             return
+
+        # Pozisyon modu: ONE_WAY
         try:
-            await self.set_position_side_oneway()
+            await self._signed("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
         except Exception as e:
             logging.warning(f"positionSide setup warning: {e}")
-        wl = cfg.get("symbols_whitelist", [])
-        margin_mode = cfg.get("margin_mode", "ISOLATED")
-        lev_cfg = cfg.get("leverage", {})
+
+        # Sembol listesi ve margin/kaldıraç ayarları
+        wl = exch_cfg.get("symbols_whitelist", [])
+        margin_mode = exch_cfg.get("margin_mode", "ISOLATED")
+        lev_cfg = exch_cfg.get("leverage", {})
+
         for sym in wl:
             try:
-                await self.set_margin_type(sym, "ISOLATED" if margin_mode == "ISOLATED" else "CROSS")
+                # Margin tipi: ISOLATED veya CROSS
+                margin_type = "ISOLATED" if margin_mode == "ISOLATED" else "CROSS"
+                await self._signed("POST", "/fapi/v1/marginType", {"symbol": sym, "marginType": margin_type})
+
+                # Kaldıraç ayarı
                 lev = int(lev_cfg.get(sym, lev_cfg.get("default", 3)))
-                await self.set_leverage(sym, lev)
+                await self._signed("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": lev})
+
             except Exception as e:
                 logging.warning(f"bootstrap warn {sym}: {e}")
+
 
     async def close(self):
         if self._client is not None:

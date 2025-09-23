@@ -288,14 +288,13 @@ class Persistence:
             self.logger.error(f"[PERSISTENCE] Pozisyon kapama hatası: {symbol} {e}")
 
 
-    def list_open_positions(self) -> List[Dict[str, Any]]:
-        with self._conn() as c:
-            cur = c.execute("SELECT symbol, side, qty, entry_price, leverage, updated_at FROM futures_positions WHERE ABS(qty) > 0")
-            rows = cur.fetchall()
-            return [
-                {"symbol": r[0], "side": r[1], "qty": float(r[2]), "entry_price": float(r[3]), "leverage": int(r[4]), "updated_at": int(r[5])}
-                for r in rows
-            ]
+    def list_open_positions(self):
+        """
+        Açık pozisyonları [{symbol, side, qty, entry_price, ...}, ...] döndürür.
+        Şimdilik hafıza içi cache'den okur.
+        """
+        self.init_open_positions_cache()
+        return list(self._open_positions_cache)
 
     def position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._conn() as c:
@@ -418,3 +417,49 @@ class Persistence:
             if side in out:
                 out[side] += 1
         return out
+
+
+    def init_open_positions_cache(self) -> None:
+        if not hasattr(self, "_open_positions_cache"):
+            # [{symbol, side, qty, entry_price, ...}]
+            self._open_positions_cache = []
+
+    def cache_add_open_position(self, symbol: str, side: str, qty: float, entry_price: float, **extras) -> None:
+        self.init_open_positions_cache()
+        side = (side or "").upper()
+        # Aynı sembolde tek pozisyon varsayımı (ONE_WAY), varsa güncelle
+        for p in self._open_positions_cache:
+            if p.get("symbol") == symbol:
+                p["side"] = side
+                p["qty"] = float(qty)
+                p["entry_price"] = float(entry_price)
+                if extras:
+                    p.update(extras)
+                break
+        else:
+            self._open_positions_cache.append({
+                "symbol": symbol,
+                "side": side,
+                "qty": float(qty),
+                "entry_price": float(entry_price),
+                **extras
+            })
+        
+    def cache_update_position(self, symbol: str, qty: float = None, entry_price: float = None, **extras) -> None:
+        self.init_open_positions_cache()
+        for p in self._open_positions_cache:
+            if p.get("symbol") == symbol:
+                if qty is not None:
+                    p["qty"] = float(qty)
+                if entry_price is not None:
+                    p["entry_price"] = float(entry_price)
+                if extras:
+                    p.update(extras)
+                break
+            
+    def cache_close_position(self, symbol: str) -> None:
+        """
+        Pozisyon tamamen kapandığında cache'ten çıkar.
+        """
+        self.init_open_positions_cache()
+        self._open_positions_cache = [p for p in self._open_positions_cache if p.get("symbol") != symbol]

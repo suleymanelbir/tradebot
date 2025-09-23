@@ -51,14 +51,15 @@ class MarketStream:
     PAPER akışı üretir ve isteğe bağlı endeks snapshot'ı sağlar.
     Websocket ZORUNLU DEĞİLDİR. (Bu sınıf WS açmaz; istenirse dışarıdan beslenebilir.)
     """
-
     def __init__(
         self,
         cfg: Dict[str, Any],
         logger: logging.Logger,
         whitelist: List[str],
         tf_entry: str = "1h",
+        tf_confirm: Optional[str] = None,
         global_db: str = "/opt/tradebot/veritabani/global_data.db",
+        persistence: Optional[bool] = False  # ✅ yeni parametre
     ):
         if not isinstance(cfg, dict):
             raise TypeError("cfg bir dict olmalı")
@@ -69,20 +70,33 @@ class MarketStream:
         self.logger = logger
         self.whitelist = list(whitelist)
         self.tf_entry = tf_entry
+        self.tf_confirm = tf_confirm or "4h"
         self.global_db = global_db
+        self.persistence = persistence
 
-        # --- İç durum ---
+        # Mode bilgisi
+        self.mode = cfg.get("app", {}).get("mode", "paper").lower()
+        self.paper = (self.mode == "paper")
+
+        # Strateji parametreleri
+        strategy_cfg = cfg.get("strategy", {}).get("params", {})
+        self.ema_period = int(strategy_cfg.get("ema_period", 20))
+        self.rsi_period = int(strategy_cfg.get("rsi_period", 14))
+        self.adx_period = int(strategy_cfg.get("adx_period", 14))
+
+        # Log prefix
+        self.log = lambda msg: self.logger.info(f"[MarketStream] {msg}")
+
+        # İç durum
         self._q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
-        self._indices_cache: Dict[str, Dict[str, Any]] = {
+        self._indices_cache = {
             "TOTAL3": {"tf1h": {"close": 0.0, "ema20": None}, "tf4h": {"close": 0.0, "ema20": None}},
             "USDT.D": {"tf1h": {"close": 0.0, "ema20": None}, "tf4h": {"close": 0.0, "ema20": None}},
             "BTC.D":  {"tf1h": {"close": 0.0, "ema20": None}, "tf4h": {"close": 0.0, "ema20": None}},
         }
-        # Sembol bazlı seri ve son fiyat tutucular
-        self._series: Dict[str, deque] = {s: deque(maxlen=2000) for s in self.whitelist}
-        self._last_prices: Dict[str, float] = {s: 100.0 for s in self.whitelist}
-        # PRICE tabanı (daha yumuşak yürüyüş için)
-        self._base: Dict[str, float] = {s: 100.0 for s in self.whitelist}
+        self._series = {s: deque(maxlen=2000) for s in self.whitelist}
+        self._last_prices = {s: 100.0 for s in self.whitelist}
+        self._base = {s: 100.0 for s in self.whitelist}
 
     # -------------------- Yardımcı hesaplamalar --------------------
 

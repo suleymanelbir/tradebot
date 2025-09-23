@@ -66,32 +66,38 @@ class OrderReconciler:
             r = cur.fetchone()
             return float(r["price"]) if r and r["price"] is not None else None
 
-    def _close_position(self, symbol: str, side: str, entry_price: float, qty: float, exit_price: float):
-        ts = self._now()
-        # realize PnL (basit): (exit-entry)*qty; qty işaretine dikkat
-        # futures_positions’da qty LONG için +, SHORT için - tutuluyor
-        signed = qty
-        pnl = (exit_price - entry_price) * signed * (-1 if side == "SHORT" else 1)
-        with self._conn() as c:
-            cur = c.cursor()
-            # trade kaydı
-            cur.execute(
-                "INSERT INTO futures_trades(order_id, symbol, side, price, qty, fee, realized_pnl, ts) "
-                "VALUES(NULL,?,?,?,?,?, ?,?)",
-                (symbol, side, float(exit_price), float(abs(qty)), 0.0, float(pnl), ts)
-            )
-            # pozisyonu sıfırla
-            cur.execute(
-                "UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?",
-                (ts, symbol)
-            )
-            c.commit()
+    def _close_position(self, symbol: str, side: str, entry_price: float, qty: float, exit_price: float) -> float:
+        """
+        Pozisyonu MARKET reduceOnly kapat ve PnL hesapla.
+        side: Pozisyon yönüne ters emir (LONG kapanırken SELL, SHORT kapanırken BUY)
+        """
+        try:
+            # 1) Borsada kapat (tek kapı)
+            self.router.close_position_market(symbol=symbol, side=side, qty=qty, tag="reconcile_close")
 
-        # cooldown: sabit 3 bar * 3600s = 10800s (paper basit yaklaşım)
-        cooldown_sec = 3 * 3600
-        self._set_symbol_state(symbol, cooldown_until=self._now() + cooldown_sec)
+            # 2) PnL hesap (senin formülün)
+            pnl = (exit_price - entry_price) * qty if side.upper() == "SELL" else (entry_price - exit_price) * qty
 
-        return pnl
+            # 3) Kayıt
+            if self.db:
+                try:
+                    self.db.record_close(symbol, side, entry_price, exit_price, qty, pnl)
+                except Exception as e:
+                    self.logger.warning(f"record_close hata: {e}")
+
+            # 4) Cache'ten temizle (tam kapanış)
+            try:
+                if hasattr(self.db, "cache_close_position"):
+                    self.db.cache_close_position(symbol)
+            except Exception as e:
+                self.logger.warning(f"cache_close_position hata: {e}")
+
+            self.logger.info(f"[RECONCILE] {symbol} kapatıldı side={side} qty={qty} entry={entry_price} exit={exit_price} pnl={pnl:.6f}")
+            return pnl
+        except Exception as e:
+            self.logger.error(f"[RECONCILE] Close error: {symbol} {e}")
+            raise
+
 
     async def run(self):
         while True:
