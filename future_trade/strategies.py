@@ -30,3 +30,7 @@ if DominanceTrend is None:
 STRATEGY_REGISTRY: Dict[str, Type[StrategyBase]] = {
     "dominance_trend": DominanceTrend,
 }
+
+"""from .strategy.my_other_strategy import MyOtherStrategy
+STRATEGY_REGISTRY["my_other"] = MyOtherStrategy
+"""

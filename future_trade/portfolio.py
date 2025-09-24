@@ -37,3 +37,5 @@ class Portfolio:
 
     def open_symbols(self) -> set[str]:
         return {p.symbol for p in self.open_positions()}
+
+    

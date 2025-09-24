@@ -1,5 +1,7 @@
-"""pkill -f "run_futures.py" || true
-    python /opt/tradebot/run_futures.py
+"""
+ps aux | grep run_futures.py dosayının çalışıp çalışmadını kontrol etemk için
+pkill -f "run_futures.py" || true   # varsa durdur
+    python /opt/tradebot/run_futures.py          varsa arka planda başlat
 
 chmod +x run_futures.py
 ./run_futures.py
