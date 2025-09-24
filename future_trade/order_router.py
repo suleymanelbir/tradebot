@@ -228,7 +228,8 @@ class OrderRouter:
         self,
         get_last_price=None,              # callable: symbol -> float | None
         list_open_positions=None,         # callable: () -> List[dict]  (symbol, side, qty, entry_price, ... )
-        upsert_stop=None                  # callable: (symbol, side, new_stop) -> Any
+        upsert_stop=None,                  # callable: (symbol, side, new_stop) -> Any
+        get_atr=None 
     ):
         """
         Trailing'in ihtiyaç duyduğu dış bağımlılıkları tak.
@@ -239,7 +240,8 @@ class OrderRouter:
         self._trail_ctx = {
             "get_last_price": get_last_price,
             "list_open_positions": list_open_positions,
-            "upsert_stop": upsert_stop
+            "upsert_stop": upsert_stop,
+            "get_atr": get_atr
         }
         self.logger.info("[TRAIL] context attached")
 
@@ -264,10 +266,11 @@ class OrderRouter:
 
         # config'ten trailing parametreleri
         tr_cfg = (self.cfg.get("trailing") or {})
-        step_pct = float(tr_cfg.get("step_pct", 0.1))  # %0.1 default
-        # ATR tabanlı gelişmiş sürüm ileride bağlanacak
-        # atr_period = int(tr_cfg.get("atr_period", 14))
-        # atr_mult = float(tr_cfg.get("atr_mult", 2.5))
+        tr_type = (tr_cfg.get("type") or "step_pct").lower()
+        step_pct = float(tr_cfg.get("step_pct", 0.1))
+        atr_period = int(tr_cfg.get("atr_period", 14))
+        atr_mult = float(tr_cfg.get("atr_mult", 2.5))
+        get_atr = ctx.get("get_atr")
 
         updated = 0
         try:
@@ -289,15 +292,27 @@ class OrderRouter:
                     self.logger.debug(f"[TRAIL] no last price for {sym}, skip")
                     continue
 
-                # Basit trailing mantığı:
-                # LONG: stop = last * (1 - step_pct/100)
-                # SHORT: stop = last * (1 + step_pct/100)  (üstten trailing)
+                new_stop = None
+                stop_side = None
+
                 if side_pos == "LONG":
-                    new_stop = last * (1.0 - step_pct / 100.0)
-                    stop_side = "SELL"   # SL tetikte satış
+                    stop_side = "SELL"
+                    if tr_type == "atr" and callable(get_atr):
+                        atr_val = get_atr(sym, atr_period)
+                        if atr_val and atr_val > 0:
+                            new_stop = last - atr_mult * atr_val
+                    if new_stop is None:
+                        new_stop = last * (1.0 - step_pct / 100.0)
+
                 elif side_pos == "SHORT":
-                    new_stop = last * (1.0 + step_pct / 100.0)
-                    stop_side = "BUY"    # SL tetikte alış
+                    stop_side = "BUY"
+                    if tr_type == "atr" and callable(get_atr):
+                        atr_val = get_atr(sym, atr_period)
+                        if atr_val and atr_val > 0:
+                            new_stop = last + atr_mult * atr_val
+                    if new_stop is None:
+                        new_stop = last * (1.0 + step_pct / 100.0)
+
                 else:
                     continue
 
@@ -307,10 +322,8 @@ class OrderRouter:
                     continue
 
                 if upsert and callable(upsert):
-                    # Canlı/paper modda gerçek SL güncellemesi bu callback'te yapılır.
                     upsert(sym, stop_side, float(new_stop))
                 else:
-                    # PAPER/LIVE ama callback yoksa şimdilik loglayıp geç
                     self.logger.info(f"[TRAIL] (no upsert_stop) {sym} {side_pos} last={last:.6f} -> stop={new_stop:.6f}")
 
                 updated += 1

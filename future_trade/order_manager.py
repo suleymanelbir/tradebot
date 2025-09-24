@@ -12,15 +12,25 @@ class OrderManager:
     Not: Tam kapanış için OrderReconciler zaten çağrılıyor; oraya ayrıca dokunacağız.
     """
 
-    def __init__(self, router: OrderRouter, persistence, market_stream, risk_manager, logger):
+    def __init__(self, router: OrderRouter, persistence, market_stream, risk_manager, logger, cfg: Dict[str, Any]):
+
         self.router = router
         self.persistence = persistence
         self.stream = market_stream
         self.risk = risk_manager
         self.logger = logger
+        self.cfg = cfg  # config'i sakla
+        self.limits = cfg.get("limits", {})  # limits_cfg yerine doğrudan cfg'den al
 
     def _last_price(self, symbol: str) -> Optional[float]:
         return self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
+
+    def _read_limit(self, *names, default=None):
+        for n in names:
+            if n in self.limits:
+                return self.limits[n]
+        return default
+
 
     @staticmethod
     def _extract_entry_fill_price(resp: Dict[str, Any], fallback_price: Optional[float]) -> float:
@@ -41,14 +51,44 @@ class OrderManager:
     def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
         intent şeması (esnek):
-          { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
-            "qty": optional float, "risk_pct": optional float,
-            "order_type": "MARKET"|"LIMIT"|"STOP_MARKET" (varsayılan: MARKET),
-            "price": optional float (LIMIT için),
-          }
+        {
+            "action": "entry",
+            "symbol": "SOLUSDT",
+            "side": "BUY" | "SELL",
+            "qty": optional float,
+            "risk_pct": optional float,
+            "order_type": "MARKET" | "LIMIT" | "STOP_MARKET",
+            "price": optional float
+        }
         """
-        symbol = intent["symbol"]
-        side = intent["side"].upper()
+
+        # ---- GUARDS ----
+        if self.kill_switch and hasattr(self.kill_switch, "is_trading_allowed") and not self.kill_switch.is_trading_allowed():
+            raise RuntimeError("Kill-Switch: trading disabled")
+
+        total, by_sym, long_n, short_n = self._count_open()
+
+        max_open_positions = int(self._read_limit("max_open_positions", "max_open_trades_global", default=0) or 0)
+        max_per_symbol     = int(self._read_limit("max_positions_per_symbol", "max_trades_per_symbol", default=0) or 0)
+        max_longs          = int(self._read_limit("max_longs", "max_long_trades", default=0) or 0)
+        max_shorts         = int(self._read_limit("max_shorts", "max_short_trades", default=0) or 0)
+
+        if max_open_positions and total >= max_open_positions:
+            raise RuntimeError("Limit: max_open_positions reached")
+
+        sym = intent["symbol"]
+        if max_per_symbol and by_sym.get(sym, 0) >= max_per_symbol:
+            raise RuntimeError(f"Limit: max_positions_per_symbol reached for {sym}")
+
+        side_up = (intent.get("side") or "").upper()
+        if side_up == "BUY" and max_longs and long_n >= max_longs:
+            raise RuntimeError("Limit: max_longs reached")
+        if side_up == "SELL" and max_shorts and short_n >= max_shorts:
+            raise RuntimeError("Limit: max_shorts reached")
+
+        # ---- ORDER PREP ----
+        symbol = sym
+        side = side_up
         order_type = intent.get("order_type") or ("MARKET" if "price" not in intent else "LIMIT")
         price = intent.get("price")
 
@@ -60,6 +100,7 @@ class OrderManager:
         if qty <= 0:
             raise ValueError("qty hesaplanamadı")
 
+        # ---- ORDER EXECUTION ----
         res = self.router.place_order(
             symbol=symbol,
             side=side,
@@ -70,7 +111,7 @@ class OrderManager:
             tag="entry"
         )
 
-        # fill/entry cache
+        # ---- CACHE FILL ----
         pos_side = "LONG" if side == "BUY" else "SHORT"
         fill_price = res.get("avgPrice") or res.get("price") or self._last_price(symbol) or price or 0.0
         if hasattr(self.persistence, "cache_add_open_position"):
@@ -78,17 +119,6 @@ class OrderManager:
 
         self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={qty} entry={fill_price}")
         return res
-
-    @staticmethod
-    def _extract_executed_qty(resp: Dict[str, Any], default_qty: float) -> float:
-        for k in ("executedQty", "executed_qty", "filledQty", "filled_qty", "cumQty"):
-            v = resp.get(k)
-            if v:
-                try:
-                    return float(v)
-                except Exception:
-                    pass
-        return float(default_qty)
 
     # ---------------- ENTRY ----------------
     def open_entry(self, symbol: str, side: str, qty: float, price: float = None, order_type: str = None, tag: str = "entry") -> Dict[str, Any]:

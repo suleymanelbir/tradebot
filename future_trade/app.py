@@ -189,7 +189,8 @@ async def main() -> None:
         router.attach_trailing_context(
             get_last_price=stream.get_last_price,
             list_open_positions=persistence.list_open_positions if hasattr(persistence, "list_open_positions") else lambda: [],
-            upsert_stop=stop_manager.upsert_stop_loss  # <<< aktif hale geldi
+            upsert_stop=stop_manager.upsert_stop_loss,  # <<< aktif hale geldi
+            get_atr=None  # ATR sağlayıcısı bağlanınca buraya fonksiyon verilecek
         )
 
     # Reconciler vs. devam edebilir...
@@ -212,7 +213,8 @@ async def main() -> None:
             persistence=persistence,
             market_stream=stream,
             risk_manager=risk_manager,  # ← eksiksiz parametre adı!
-            logger=logger
+            logger=logger,
+            cfg=cfg
         )
 
         # Trailing bağlamı
