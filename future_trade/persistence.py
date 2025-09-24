@@ -203,7 +203,7 @@ class Persistence:
             cur = c.execute("SELECT trail_stop FROM symbol_state WHERE symbol=?", (symbol,))
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
-
+    
     def set_last_signal_ts(self, symbol: str, ts: int) -> None:
         with self._conn() as c:
             c.execute("""
@@ -463,3 +463,69 @@ class Persistence:
         """
         self.init_open_positions_cache()
         self._open_positions_cache = [p for p in self._open_positions_cache if p.get("symbol") != symbol]
+
+    # --- Günlük PnL ve equity tahmini için yardımcılar ---
+
+    def record_close(self, symbol: str, side: str, entry_price: float, exit_price: float, qty: float, pnl: float) -> None:
+        """
+        Kapanışları günlük PnL için kaydetmek üzere temel kayıt. Şu anlık sadece bellekte.
+        İstersen burayı veritabanına yazacak şekilde genişletebilirsin.
+        """
+        if not hasattr(self, "_realized_pnl_today"):
+            self._realized_pnl_today = 0.0
+            self._realized_pnl_day = None
+        # gün değiştiyse sıfırla
+        import datetime as _dt
+        today = _dt.date.today()
+        if self._realized_pnl_day != today:
+            self._realized_pnl_day = today
+            self._realized_pnl_today = 0.0
+        self._realized_pnl_today += float(pnl)
+
+    def get_today_realized_pnl(self) -> float:
+        if not hasattr(self, "_realized_pnl_today"):
+            return 0.0
+        # gün kontrolü
+        import datetime as _dt
+        today = _dt.date.today()
+        if getattr(self, "_realized_pnl_day", today) != today:
+            return 0.0
+        return float(self._realized_pnl_today or 0.0)
+
+    def estimate_unrealized_pnl(self, price_provider) -> float:
+        """
+        Açık pozisyonlardan anlık (unrealized) PnL tahmini.
+        list_open_positions() -> [{symbol, side:'LONG'|'SHORT', qty, entry_price}, ...]
+        """
+        try:
+            positions = self.list_open_positions() or []
+        except Exception:
+            positions = []
+        total = 0.0
+        for p in positions:
+            sym = p.get("symbol")
+            side = (p.get("side") or "").upper()
+            qty = abs(float(p.get("qty", 0) or 0))
+            entry = float(p.get("entry_price", 0) or 0)
+            if not sym or qty <= 0 or entry <= 0:
+                continue
+            last = price_provider(sym) if callable(price_provider) else None
+            if last is None:
+                continue
+            if side == "LONG":
+                total += (last - entry) * qty
+            elif side == "SHORT":
+                total += (entry - last) * qty
+        return float(total)
+
+    def estimate_account_equity(self, price_provider, start_equity_fallback: float = 1000.0) -> float:
+        """
+        Basit equity tahmini: start_equity + realized_today + unrealized.
+        Gerçek cüzdan bakiyen varsa burada onu kullanacak şekilde güncelleyebiliriz.
+        """
+        realized = self.get_today_realized_pnl()
+        unrealized = self.estimate_unrealized_pnl(price_provider)
+        start_eq = float(start_equity_fallback or 0.0)
+        return start_eq + realized + unrealized
+
+        

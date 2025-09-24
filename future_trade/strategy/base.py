@@ -8,7 +8,8 @@ from typing import Optional, Dict, Any
 @dataclass
 class Signal:
     """Stratejinin ürettiği sinyal."""
-    side: str                      # "LONG" | "SHORT" | "FLAT"
+    side: str                   # "LONG" | "SHORT" | "FLAT"
+    strength: Optional[float] = None                      
     entry: Optional[float] = None  # referans giriş fiyatı (son kapalı mum)
     sl: Optional[float] = None     # stop-loss fiyatı
     tp: Optional[float] = None     # take-profit fiyatı

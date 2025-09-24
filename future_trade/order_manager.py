@@ -1,8 +1,7 @@
 # /opt/tradebot/future_trade/order_manager.py
 from __future__ import annotations
 from typing import Dict, Any, Optional
-
-from .order_router import OrderRouter, Mode
+from .order_router import OrderRouter
 
 class OrderManager:
     """
@@ -13,11 +12,15 @@ class OrderManager:
     Not: Tam kapanış için OrderReconciler zaten çağrılıyor; oraya ayrıca dokunacağız.
     """
 
-    def __init__(self, router: OrderRouter, persistence, market_stream, logger):
+    def __init__(self, router: OrderRouter, persistence, market_stream, risk_manager, logger):
         self.router = router
         self.persistence = persistence
         self.stream = market_stream
+        self.risk = risk_manager
         self.logger = logger
+
+    def _last_price(self, symbol: str) -> Optional[float]:
+        return self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
 
     @staticmethod
     def _extract_entry_fill_price(resp: Dict[str, Any], fallback_price: Optional[float]) -> float:
@@ -33,6 +36,48 @@ class OrderManager:
                 except Exception:
                     pass
         return float(fallback_price or 0.0)
+
+    
+    def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        intent şeması (esnek):
+          { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
+            "qty": optional float, "risk_pct": optional float,
+            "order_type": "MARKET"|"LIMIT"|"STOP_MARKET" (varsayılan: MARKET),
+            "price": optional float (LIMIT için),
+          }
+        """
+        symbol = intent["symbol"]
+        side = intent["side"].upper()
+        order_type = intent.get("order_type") or ("MARKET" if "price" not in intent else "LIMIT")
+        price = intent.get("price")
+
+        # qty belirleme: önce intent.qty, yoksa risk manager
+        qty = float(intent.get("qty") or 0)
+        if qty <= 0 and hasattr(self.risk, "position_size"):
+            last = self._last_price(symbol)
+            qty = float(self.risk.position_size(symbol, side, last_price=last, risk_pct=intent.get("risk_pct")))
+        if qty <= 0:
+            raise ValueError("qty hesaplanamadı")
+
+        res = self.router.place_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_type=order_type,
+            reduce_only=False,
+            tag="entry"
+        )
+
+        # fill/entry cache
+        pos_side = "LONG" if side == "BUY" else "SHORT"
+        fill_price = res.get("avgPrice") or res.get("price") or self._last_price(symbol) or price or 0.0
+        if hasattr(self.persistence, "cache_add_open_position"):
+            self.persistence.cache_add_open_position(symbol, pos_side, qty, float(fill_price))
+
+        self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={qty} entry={fill_price}")
+        return res
 
     @staticmethod
     def _extract_executed_qty(resp: Dict[str, Any], default_qty: float) -> float:
@@ -90,45 +135,27 @@ class OrderManager:
         return res
 
     # ---------------- PARTIAL CLOSE ----------------
-    def partial_close(self, symbol: str, current_side: str, close_qty: float, tag: str = "partial_close") -> Dict[str, Any]:
-        """
-        Açık pozisyondan kısmi çıkış. reduceOnly MARKET ile kapatır ve cache'i günceller.
-        current_side: mevcut pozisyon yönü ("LONG" | "SHORT")
-        """
-        current_side = current_side.upper()
-        if current_side not in ("LONG", "SHORT"):
-            raise ValueError("current_side LONG veya SHORT olmalı")
+    def partial_close(self, symbol: str, position_side: str, qty: float) -> Dict[str, Any]:
+        position_side = position_side.upper()
+        if position_side not in ("LONG", "SHORT"):
+            raise ValueError("position_side must be LONG or SHORT")
 
-        # Kapatma yönü emir side:
-        side_for_order = "SELL" if current_side == "LONG" else "BUY"
+        side_for_order = "SELL" if position_side == "LONG" else "BUY"
+        res = self.router.close_position_market(symbol=symbol, side=side_for_order, qty=qty, tag="partial_close")
 
-        res = self.router.close_position_market(
-            symbol=symbol,
-            side=side_for_order,
-            qty=close_qty,
-            tag=tag
-        )
-
-        # Cache güncelle: yeni qty = eski qty - close_qty
         try:
             if hasattr(self.persistence, "list_open_positions"):
-                positions = self.persistence.list_open_positions() or []
-                old_qty = None
-                for p in positions:
+                for p in self.persistence.list_open_positions():
                     if p.get("symbol") == symbol:
-                        old_qty = float(p.get("qty", 0))
-                        break
-                if old_qty is not None:
-                    new_qty = max(0.0, old_qty - float(close_qty))
-                    if new_qty > 0:
-                        if hasattr(self.persistence, "cache_update_position"):
+                        new_qty = max(0.0, float(p.get("qty", 0)) - float(qty))
+                        if new_qty > 0 and hasattr(self.persistence, "cache_update_position"):
                             self.persistence.cache_update_position(symbol, qty=new_qty)
-                    else:
-                        # Tamamen kapanmış say → cache'ten sil
-                        if hasattr(self.persistence, "cache_close_position"):
+                        elif new_qty == 0 and hasattr(self.persistence, "cache_close_position"):
                             self.persistence.cache_close_position(symbol)
+                        break
         except Exception as e:
-            self.logger.warning(f"partial_close cache update hata: {e}")
+            self.logger.warning(f"[PARTIAL CLOSE] cache update error: {e}")
 
-        self.logger.info(f"[PARTIAL CLOSE] {symbol} {current_side} -{close_qty}")
+        self.logger.info(f"[PARTIAL CLOSE] {symbol} {position_side} -{qty}")
         return res
+

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# ---- Standart kütüphaneler ----
 import os
 import signal
 import asyncio
@@ -10,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
-# ---- Proje içi importlar (modül kökünden) ----
+# ---- Proje içi modüller ----
 from future_trade.config_loader import load_config                       # async config loader
 from future_trade.telegram_notifier import Notifier                      # Telegram bildirimleri
 from future_trade.persistence import Persistence                         # DB erişimi ve cache
@@ -23,7 +24,17 @@ from future_trade.exchange_utils import ExchangeNormalizer               # Preci
 from future_trade.order_reconciler import OrderReconciler                # Emir mutabakatı (close + PnL)
 from future_trade.position_supervisor import PositionSupervisor          # Pozisyon gözetmen
 from future_trade.strategies import STRATEGY_REGISTRY                    # Strateji kayıt sistemi
-from future_trade.loops import strat_loop, trailing_loop                 # Ana döngüler
+from future_trade.kill_switch import KillSwitch                          # Risk bazlı işlem engelleyici
+from future_trade.order_manager import OrderManager                      # Emir yöneticisi
+from future_trade.stop_manager import StopManager                        # Stop-loss yöneticisi
+
+# ---- Ana döngüler ----
+from future_trade.loops import (
+    strat_loop,
+    trailing_loop,
+    kill_switch_loop,
+    daily_reset_loop
+)
 
 
 # Varsayılan config yolu (ENV yoksa)
@@ -167,6 +178,43 @@ async def main() -> None:
             paper_engine=None  # istersen client.paper_engine bağlayabilirsin
         )
 
+        # ✅ StopManager: router hazır olduğunda oluşturulmalı
+        stop_manager = StopManager(
+            router=router,
+            persistence=persistence,
+            logger=logging.getLogger("stop_manager") 
+        )
+
+        # ✅ Trailing context: artık stop_manager üzerinden stop güncellemesi yapılabilir
+        router.attach_trailing_context(
+            get_last_price=stream.get_last_price,
+            list_open_positions=persistence.list_open_positions if hasattr(persistence, "list_open_positions") else lambda: [],
+            upsert_stop=stop_manager.upsert_stop_loss  # <<< aktif hale geldi
+        )
+
+    # Reconciler vs. devam edebilir...
+
+        # RiskManager: config ve portfolio ile oluştur
+        risk_cfg = cfg.get("risk", {})
+        leverage_map = cfg.get("leverage_map", {})
+        risk_manager = RiskManager(
+            risk_cfg=risk_cfg,
+            leverage_map=leverage_map,
+            portfolio=portfolio  # daha önce tanımlanmış olmalı
+        )
+        logger.info(f"[RISK INIT] per_trade={risk_manager.per_trade_risk_pct:.4f} daily_max_loss={risk_manager.daily_max_loss_pct:.4f} "
+                    f"max_concurrent={risk_manager.max_concurrent} kill_switch_after={risk_manager.kill_switch_after} buffer={risk_manager.min_notional_buffer}")
+
+
+        # 2️⃣ OrderManager: router hazır olduğunda oluşturulabilir
+        order_manager = OrderManager(
+            router=router,
+            persistence=persistence,
+            market_stream=stream,
+            risk_manager=risk_manager,  # ← eksiksiz parametre adı!
+            logger=logger
+        )
+
         # Trailing bağlamı
         router.attach_trailing_context(
             get_last_price=stream.get_last_price,
@@ -188,10 +236,25 @@ async def main() -> None:
         if hasattr(persistence, "router") and persistence.router is None:
             persistence.router = router
 
+        # Kill-Switch
+        ks_logger = logging.getLogger("kill_switch")
+        kill_switch = KillSwitch(
+            cfg=cfg,
+            persistence=persistence,
+            reconciler=reconciler,
+            notifier=notifier,
+            price_provider=lambda s: stream.get_last_price(s),
+            logger=ks_logger
+        )
+
+
     except Exception as e:
         logging.error(f"Router/Reconciler/Supervisor init failed: {e}")
         await notifier.alert({"event": "startup_error", "msg": f"❌ Router/Reconciler/Supervisor failed: {e}"})
         return
+
+        
+
 
     # ---------- Graceful shutdown ----------
     stop = asyncio.Event()
@@ -203,15 +266,16 @@ async def main() -> None:
             pass
 
     # ---------- Görevler ----------
+    asyncio.create_task(daily_reset_loop(kill_switch, notifier, stop_event=stop, tz_offset_hours=3), name="ks_daily_reset"), # İstanbul saati (UTC+3)
+
     tasks = [
         asyncio.create_task(stream.run(), name="stream"),
         asyncio.create_task(
-            strat_loop(stream, strategy, portfolio, supervisor, risk, router, persistence, notifier, cfg),
+            strat_loop(stream, strategy, portfolio, supervisor, risk, router, persistence, notifier, cfg, kill_switch=kill_switch),
             name="strat_loop",
         ),
-        # reconciler.run() senin proje akışına bağlı; loop varsa aktif et
-        # asyncio.create_task(reconciler.run(), name="reconciler"),
         asyncio.create_task(trailing_loop(router, stream, notifier, cfg, stop), name="trailing"),
+        asyncio.create_task(kill_switch_loop(kill_switch, notifier, interval_sec=10, stop_event=stop), name="kill_switch, order_manager=order_manager"),
     ]
 
     await notifier.info_trades({"event": "startup", "msg": "✅ All modules initialized. Bot is running."})

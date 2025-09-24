@@ -76,16 +76,17 @@ class OrderRouter:
 
     # ---------- dış arayüz ----------
     def place_order(
-        self,
-        symbol: str,
-        side: str,                    # "BUY" | "SELL"
-        qty: float,
-        price: Optional[float] = None,
-        order_type: Optional[str] = None,        # "MARKET" | "LIMIT" | "STOP" | ...
-        time_in_force: Optional[str] = None,     # "GTC" | "IOC" | "FOK"
-        reduce_only: bool = False,
-        tag: str = ""
-    ) -> Dict[str, Any]:
+    self,
+    symbol: str,
+    side: str,                          # "BUY" | "SELL"
+    qty: float,
+    price: Optional[float] = None,
+    order_type: Optional[str] = None,  # "MARKET" | "LIMIT" | "STOP" | ...
+    time_in_force: Optional[str] = None,  # "GTC" | "IOC" | "FOK"
+    reduce_only: bool = False,
+    stop_price: Optional[float] = None,   # ← STOP-MARKET için destek
+    tag: str = ""
+) -> Dict[str, Any]:
         """
         Emir açma tek kapısı.
         - DRY: sadece log
@@ -101,6 +102,7 @@ class OrderRouter:
         norm = self.norm.normalize(symbol, qty=qty, price=price)
         qty_n, price_n = norm["qty"], norm["price"]
 
+        # Temel payload
         payload = {
             "symbol": symbol,
             "side": side,
@@ -109,14 +111,38 @@ class OrderRouter:
             "reduceOnly": reduce_only,
             "newClientOrderId": client_order_id
         }
-        if price_n is not None and order_type in ("LIMIT", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
-            payload["price"] = price_n
+
+        # LIMIT/STOP/TAKE_PROFIT gibi fiyatlı emirler
+        if order_type in ("LIMIT", "STOP", "STOP_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
+            if price_n is not None:
+                payload["price"] = price_n
             payload["timeInForce"] = time_in_force
 
+        # STOP-MARKET ve benzeri emirler için stopPrice desteği
+        if order_type in (
+            "STOP", "STOP_MARKET", "STOP_LIMIT",
+            "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_LIMIT"
+        ):
+            if stop_price is None and price_n is not None and order_type.endswith("MARKET"):
+                # Bazı akışlarda stop_price yerine price geçilmiş olabilir
+                stop_price = price_n
+            if stop_price is not None:
+                payload["stopPrice"] = float(stop_price)
+
+            # Çalışma fiyat tipi (MARK_PRICE / CONTRACT_PRICE)
+            working_type = (self.cfg.get("order", {}) or {}).get("sl_working_type", "MARK_PRICE")
+            payload["workingType"] = working_type
+
+        # DRY mode: sadece log
         if self.mode == Mode.DRY:
             self.logger.info(f"[DRY] place_order {payload}")
-            return {"status": "DRY_LOGGED", "clientOrderId": client_order_id, "payload": payload}
+            return {
+                "status": "DRY_LOGGED",
+                "clientOrderId": client_order_id,
+                "payload": payload
+            }
 
+        # PAPER mode: simülasyon
         if self.mode == Mode.PAPER:
             if not self.paper:
                 raise RuntimeError("PAPER mode aktif ama paper_engine atanmamış")
@@ -124,13 +150,14 @@ class OrderRouter:
             self.logger.info(f"[PAPER] {res}")
             return res
 
-        # LIVE (sync/async fark etmeyecek)
+        # LIVE mode: gerçek emir
         call = getattr(self.binance, "new_order", None)
         if call is None:
             raise AttributeError("binance_client.new_order bulunamadı")
         res = self._maybe_await(call(**payload))
         self.logger.info(f"[LIVE] {res}")
         return res
+
 
     def cancel(self, symbol: str, client_order_id: Optional[str] = None, order_id: Optional[int] = None) -> Dict[str, Any]:
         if self.mode == Mode.DRY:
