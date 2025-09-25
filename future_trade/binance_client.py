@@ -312,3 +312,53 @@ class BinanceClient:
                 await self._client.aclose()
             except Exception:
                 pass
+
+    # Sınıf içine ekle
+    async def futures_klines(self, symbol: str, interval: str = "1h", limit: int = 200):
+        """
+        Binance Futures kline verisi (open, high, low, close, volume).
+        Dönüş: [ [openTime, open, high, low, close, volume, closeTime, ...], ... ]
+        """
+        # PAPER modda da gerçek endpoint'e istek atmak istemiyorsan burada stub döndürebilirsin.
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            # Basit stub: market_stream sadece close ürettiği için ATR'yi step_pct'e düşüreceğiz.
+            return []  # boş dönersek ATR sağlayıcı fallback'e düşer
+
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": int(limit)
+        }
+        # Projendeki HTTP get yardımcı fonksiyonun adı farklı olabilir → kendi helper’ına göre ayarla
+        # Örn: await self._get("/fapi/v1/klines", params)
+        get = getattr(self, "_get", None) or getattr(self, "http_get", None)
+        if not callable(get):
+            raise RuntimeError("binance_client: _get/http_get helper not found")
+        return await get("/fapi/v1/klines", params=params)
+
+
+    # Sınıf içine ekle
+    async def list_open_orders(self, symbol: str = None):
+        """
+        Açık emirleri döndürür. Futures için /fapi/v1/openOrders
+        Dönüş: [ {...order...}, ... ]
+        """
+        # PAPER modda ağ kapalıysa boş liste döndür
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            return []
+
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+
+        get = getattr(self, "_get", None) or getattr(self, "http_get", None)
+        if not callable(get):
+            raise RuntimeError("binance_client: _get/http_get helper not found")
+
+        # Binance, openOrders için imzalı GET ister (timestamp/recvWindow)
+        # Projede imzalı GET helper'ınız varsa onu kullanın:
+        signed_get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None)
+        if callable(signed_get):
+            return await signed_get("/fapi/v1/openOrders", params=params)
+        # Yoksa _get zaten imzalı sürümü kapsıyorsa onu kullanın
+        return await get("/fapi/v1/openOrders", params=params)

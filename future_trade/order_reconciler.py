@@ -1,116 +1,89 @@
 # /opt/tradebot/future_trade/order_reconciler.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Callable, Optional, Dict, Any
+
+import asyncio
 import logging
+from typing import Optional, Dict, Any, List
 
-from .order_router import OrderRouter, Mode   
-
-
-class _ClientAdapter:
-    """
-    Eski imzayla gelen client'ı (binance wrapper) router benzeri arayüze çevirir.
-    Sadece close_position_market için gereken new_order'ı kullanır.
-    """
-    def __init__(self, client, logger: logging.Logger):
-        self.client = client
-        self.logger = logger
-
-    def close_position_market(self, symbol: str, side: str, qty: float, tag: str = "reconcile_close") -> Dict[str, Any]:
-        # reduceOnly MARKET kapatma (client new_order varsa)
-        call = getattr(self.client, "new_order", None)
-        if call is None:
-            raise AttributeError("ClientAdapter: client.new_order bulunamadı")
-        payload = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": qty,
-            "reduceOnly": True,
-            "newClientOrderId": f"RC|{symbol}|{tag}"
-        }
-        res = call(**payload)
-        self.logger.info(f"[RECONCILE-LIVE] {res}")
-        return res
+# Eski: from .order_router import OrderRouter, Mode
+# Yeni: Mode yok; yalnızca OrderRouter kullanıyoruz
+from .order_router import OrderRouter
 
 
 class OrderReconciler:
     """
-    Geriye dönük uyumlu reconciler.
-
-    Desteklenen kurulumlar:
-      - Yeni mimari: OrderReconciler(router=router, persistence=..., logger=..., price_provider=...)
-      - Eski mimari: OrderReconciler(client=client, persistence=..., notifier=..., price_provider=..., logger=...)
-
-    Temel iş: pozisyon kapatma (reduceOnly MARKET) + PnL hesap/kayıt.
+    Emir/pozisyon uzlaştırma katmanı:
+      - (opsiyonel) açık pozisyonların durumunu DB ile senkron tutma
+      - toplu kapatma (kill-switch vb.)
+      - ileride: fill/partial fill/stop tetikleriyle eşleştirme (genişletilebilir)
     """
-    def __init__(
-        self,
-        router: Optional[OrderRouter] = None,
-        *,
-        client: Optional[object] = None,
-        persistence: Optional[object] = None,
-        notifier: Optional[object] = None,
-        logger: Optional[logging.Logger] = None,
-        price_provider: Optional[Callable[[str], float]] = None
-    ):
+
+    def __init__(self, router: OrderRouter, logger: Optional[logging.Logger] = None, persistence=None):
+        self.router = router
         self.logger = logger or logging.getLogger("reconciler")
-        self.db = persistence
-        self.notifier = notifier
-        self._price_provider = price_provider
+        self.persistence = persistence
 
-        if router is not None:
-            self.router = router
-        elif client is not None:
-            # Eski kullanım: client'ı adapter ile router benzeri arayüze çevir
-            self.router = _ClientAdapter(client, self.logger)  # type: ignore
-        else:
-            raise ValueError("OrderReconciler: router veya client parametresinden en az biri zorunlu")
+    # ------- yardımcılar -------
+    def _is_paper(self) -> bool:
+        # router.client.mode genelde "paper" | "live"
+        mode = getattr(getattr(self.router, "client", None), "mode", "paper")
+        return str(mode).lower() == "paper"
 
-    # Dışarıdan çağrılan yardımcı
-    def close_all_for_symbol(self, symbol: str, position_side: str, qty: float, entry_price: float, exit_price: Optional[float] = None) -> float:
+    def _list_open_positions(self) -> List[Dict[str, Any]]:
+        if hasattr(self.persistence, "list_open_positions"):
+            try:
+                return self.persistence.list_open_positions() or []
+            except Exception as e:
+                self.logger.debug(f"list_open_positions failed: {e}")
+        return []
+
+    # ------- toplu kapatma (Kill-Switch vs.) -------
+    def close_all_positions(self, reason: str = "kill_switch") -> Dict[str, Any]:
         """
-        Verilen semboldeki pozisyonu tamamen kapatır, PnL döndürür.
-        position_side: 'LONG' veya 'SHORT'
+        Tüm açık pozisyonları reduceOnly-MARKET ile kapatmayı dener.
         """
-        side_for_order = "SELL" if position_side.upper() == "LONG" else "BUY"
+        results = {"closed": 0, "errors": []}
+        positions = self._list_open_positions()
+        for p in positions:
+            try:
+                sym = p.get("symbol")
+                side_pos = (p.get("side") or "").upper()  # LONG/SHORT
+                qty = abs(float(p.get("qty", 0) or 0))
+                if not sym or qty <= 0 or side_pos not in ("LONG", "SHORT"):
+                    continue
 
-        if exit_price is None:
-            exit_price = float(self._price_provider(symbol)) if self._price_provider else entry_price
+                # Kapatma için ters yön gerekir
+                side_close = "SELL" if side_pos == "LONG" else "BUY"
+                self.router.close_position_market(sym, side_close, qty, tag=reason)
+                results["closed"] += 1
 
-        return self._close_position(symbol, side_for_order, entry_price, abs(float(qty)), float(exit_price))
+                # DB cache güncelle (varsa)
+                if hasattr(self.persistence, "cache_close_position"):
+                    try:
+                        self.persistence.cache_close_position(sym)
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.error(f"[RECON] close_all_positions error: {e}")
+                results["errors"].append({"position": p, "error": str(e)})
+        return results
 
-    # İç iş: kapat + PnL + kayıt
-    def _close_position(self, symbol: str, side: str, entry_price: float, qty: float, exit_price: float) -> float:
+    # ------- ana döngü -------
+    async def run(self) -> None:
+        """
+        Minimal bir uzlaştırma döngüsü.
+        (Şimdilik pasif; ileride fill/event tabanlı eşleştirmeler eklenebilir.)
+        """
+        self.logger.info("OrderReconciler loop started (mode=%s)", "paper" if self._is_paper() else "live")
         try:
-            # 1) Borsada kapat (tek kapı / adapter)
-            self.router.close_position_market(symbol=symbol, side=side, qty=qty, tag="reconcile_close")
-
-            # 2) PnL hesap
-            pnl = (exit_price - entry_price) * qty if side.upper() == "SELL" else (entry_price - exit_price) * qty
-
-            # 3) Kayıt (varsa)
-            if self.db and hasattr(self.db, "record_close"):
-                try:
-                    self.db.record_close(symbol, side, entry_price, exit_price, qty, pnl)
-                except Exception as e:
-                    self.logger.warning(f"record_close hata: {e}")
-
-            # 4) Cache'ten temizle (varsa)
-            if self.db and hasattr(self.db, "cache_close_position"):
-                try:
-                    self.db.cache_close_position(symbol)
-                except Exception as e:
-                    self.logger.warning(f"cache_close_position hata: {e}")
-
-            self.logger.info(f"[RECONCILE] {symbol} kapatıldı side={side} qty={qty} entry={entry_price} exit={exit_price} pnl={pnl:.6f}")
-            return pnl
+            while True:
+                # Burada periyodik kontrol/uyumlama yapılabilir.
+                # Örn: self._reconcile_positions()
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            self.logger.info("OrderReconciler loop cancelled")
         except Exception as e:
-            self.logger.error(f"[RECONCILE] Close error: {symbol} {e}")
-            # Bildirim
-            if self.notifier and hasattr(self.notifier, "alert"):
-                try:
-                    # async olup olmamasını önemsemiyoruz; fire-and-forget
-                    self.notifier.alert({"event": "reconcile_error", "symbol": symbol, "error": str(e)})
-                except Exception:
-                    pass
-            raise
+            self.logger.error(f"OrderReconciler loop error: {e}")
+            # Döngü çökmesin diye kısa bekleme
+            await asyncio.sleep(1.0)

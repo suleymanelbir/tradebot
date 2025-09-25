@@ -5,12 +5,13 @@ Risk & boyutlandırma:
 - Stop/TP yoksa basit yüzdesel SL/TP kuralı uygula (paper için yeterli)
 - Leverage haritası (cfg["leverage"]) dikkate alınır
 - Min notional buffer uygulanır (cfg["risk"].min_notional_buffer)
-NOT: Gerçek modda tick/step/minNotional filtreleri OrderRouter/exchange_utils ile birlikte uygulanacak.
+- NORMALİZASYON: price/qty (tick/step) ve minNotional kontrolleri için
+  normalizer kancaları desteklenir (bind_normalizer / bind_trailing_cfg / bind_atr_provider).
 """
 
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
-import math
+
 
 
 @dataclass
@@ -49,6 +50,27 @@ class RiskManager:
         self.kill_switch_after = int(self.risk_cfg.get("kill_switch_after_consecutive_losses", 4))
         self.min_notional_buffer = float(self.risk_cfg.get("min_notional_buffer", 1.1))
 
+        # Opsiyonel kancalar (app tarafından bağlanabilir)
+        self.order_cfg: Dict[str, Any] = {}
+        self.trailing_cfg: Dict[str, Any] = {}
+        self.normalizer = None           # exchange_utils.ExchangeNormalizer
+        self._get_atr = None             # callable(symbol, period) -> float|None
+
+    # ---------- KANCALAR ----------
+    def bind_order_cfg(self, order_cfg: Dict[str, Any]):
+        self.order_cfg = order_cfg or {}
+
+    def bind_trailing_cfg(self, trailing_cfg: Dict[str, Any]):
+        self.trailing_cfg = trailing_cfg or {}
+
+    def bind_normalizer(self, normalizer):
+        self.normalizer = normalizer
+
+    def bind_atr_provider(self, get_atr_callable):
+        """get_atr(symbol:str, period:int) -> float|None"""
+        self._get_atr = get_atr_callable
+
+    # ---------- YARDIMCILAR ----------
     def _symbol_leverage(self, symbol: str) -> int:
         return int(self.lev_map.get(symbol, self.lev_map.get("default", 3)))
 
@@ -67,6 +89,75 @@ class RiskManager:
             tp = entry - (sl - entry) * tp_rr
         return entry, sl, tp
 
+    def _stop_distance_from_trailing(self, symbol: str, last_price: float) -> Optional[float]:
+        """
+        Trailing cfg'ye göre tahmini bir stop mesafesi üretir.
+        ATR mevcutsa atr_mult*ATR; yoksa step_pct * last_price.
+        """
+        if not last_price or last_price <= 0:
+            return None
+        tr = self.trailing_cfg or {}
+        tr_type = (tr.get("type") or "step_pct").lower()
+        atr_period = int(tr.get("atr_period", 14))
+        atr_mult = float(tr.get("atr_mult", 2.5))
+        step_pct = float(tr.get("step_pct", 0.1))
+        if tr_type == "atr" and callable(self._get_atr):
+            try:
+                atr_val = self._get_atr(symbol, atr_period)
+                if atr_val and atr_val > 0:
+                    return atr_mult * float(atr_val)
+            except Exception:
+                pass
+        # fallback: step_pct
+        return float(last_price) * (step_pct / 100.0)
+
+    # ---------- BOYUTLANDIRMA (OrderManager çağırabilir) ----------
+    def position_size(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        last_price: Optional[float] = None,
+        risk_pct: Optional[float] = None
+    ) -> float:
+        """
+        Qty hesaplar. Adımlar:
+          1) Equity * risk_pct
+          2) Stop mesafesi (ATR/step) ile böl
+          3) Normalizer ile qty yuvarla ve minNotional'i sağlamaya çalış
+        """
+        # 1) equity ve risk
+        equity = float(self.portfolio.equity())
+        if equity <= 0:
+            return 0.0
+        use_risk = float(risk_pct/100.0) if risk_pct is not None else self.per_trade_risk_pct
+        risk_cap = equity * use_risk
+        if risk_cap <= 0:
+            return 0.0
+
+        # 2) stop distance
+        if not last_price or last_price <= 0:
+            return 0.0
+        stop_dist = self._stop_distance_from_trailing(symbol, float(last_price))
+        if not stop_dist or stop_dist <= 0:
+            return 0.0
+
+        qty = risk_cap / float(stop_dist)
+        if qty <= 0:
+            return 0.0
+
+        # 3) normalizer ile adım/minNotional
+        if self.normalizer:
+            # qty adımına yuvarla
+            qty = self.normalizer.normalize_qty(symbol, qty)
+            if qty <= 0:
+                return 0.0
+            # MARKET için minNotional — last_price ile kontrol et
+            qty = self.normalizer.ensure_min_notional(symbol, float(last_price), qty)
+
+        return float(qty)
+
+    # ---------- STRATEJİDEN GELEN SİNYAL İLE PLAN ----------
     def plan_trade(self, symbol: str, signal) -> TradePlan:
         """
         Strategy.on_bar() sonucu gelen sinyal doğrultusunda boyutlandırma yapar.
@@ -88,11 +179,8 @@ class RiskManager:
         # Leverage
         lev = self._symbol_leverage(symbol)
 
-        # Paper akış: son fiyatı portföy/stream tarafı verebiliyor; burada son close'u portfolio'dan almıyoruz.
-        # Router, plan.entry yoksa "stream.get_last_price()" kullanıyor olabilir; güvenli taraf için entry'yi burada hesaplayalım.
-        # (app/strategy tarafı event.close taşıyorsa, plan.entry'yi onu kullanan yere geçirmen de mümkün)
-        # Basit yaklaşım: entry/SL/TP fallback parametreleri
-        order_cfg: Dict[str, Any] = getattr(self, "order_cfg", {}) or {}
+        # Emir türleri fallback parametreleri
+        order_cfg: Dict[str, Any] = self.order_cfg or {}
         sl_pct = float(order_cfg.get("sl_pct", 1.0))    # %1 varsayılan
         tp_rr  = float(order_cfg.get("tp_rr", 1.5))     # RR=1.5 varsayılan
 
@@ -105,19 +193,35 @@ class RiskManager:
             return TradePlan(ok=False, reason="invalid_stop_distance")
 
         # Boyut (qty)
-        # NOT: USDT margined sözleşmelerde notional = price * qty
         qty = risk_cap / stop_distance
         if qty <= 0:
             return TradePlan(ok=False, reason="qty_zero")
 
-        # Min notional buffer (ör. 1.1x)
+        # Min notional buffer (paper koruması)
         notional = entry * qty
         min_notional = 5.0  # paper için muhafazakar default; gerçek filtre ile değişecek
         if notional < min_notional * self.min_notional_buffer:
             # qty'yi yükseltmek yerine güvenli tarafta reddedelim (paper)
             return TradePlan(ok=False, reason=f"min_notional_violation wanted={notional:.2f} min~{min_notional*self.min_notional_buffer:.2f}")
 
-        # Paper için kaba quantize (gerçekte symbol_filters ile step/tick uygulanacak)
+        # --- NORMALİZASYON: qty/price adımlarına oturt ---
+        if self.normalizer:
+            try:
+                # entry normalizasyonu (tick)
+                entry_n = self.normalizer.normalize_price(symbol, entry)
+                # qty normalizasyonu (step)
+                qty_n = self.normalizer.normalize_qty(symbol, qty)
+                # minNotional (LIMIT için price; MARKET'te last_price gerek; plan aşamasında entry kabul)
+                qty_n = self.normalizer.ensure_min_notional(symbol, entry_n, qty_n)
+                # uygunsa kullan
+                if qty_n > 0:
+                    qty = qty_n
+                    entry = entry_n
+            except Exception:
+                # normalizer sorun çıkarırsa plan yine de dönsün; router son kapı kontrol yapar
+                pass
+
+        # Paper için kaba quantize (ek koruma; normalizer yoksa devrede)
         qty = max(0.001, float(f"{qty:.3f}"))
 
         # Emir türleri & flags (OrderRouter ile uyumlu)
@@ -137,7 +241,3 @@ class RiskManager:
             reduce_only_protection=bool(order_cfg.get("reduce_only_protection", True)),
         )
         return plan
-
-    # app.py içinde RiskManager yaratılırken order ayarlarını enjekte edebilmen için:
-    def bind_order_cfg(self, order_cfg: Dict[str, Any]):
-        self.order_cfg = order_cfg or {}

@@ -1,29 +1,41 @@
 # /opt/tradebot/future_trade/order_manager.py
 from __future__ import annotations
 from typing import Dict, Any, Optional
+import logging
+
 from .order_router import OrderRouter
 
 class OrderManager:
-    """
-    Router üstü ince yönetim katmanı:
-    - Entry aç → persistence.cache_add_open_position(...)
-    - Kısmi kapat → persistence.cache_update_position(...)
-    - Tam kapat (kapanış fonksiyonları zaten Reconciler'da) → persistence.cache_close_position(...)
-    Not: Tam kapanış için OrderReconciler zaten çağrılıyor; oraya ayrıca dokunacağız.
-    """
-
-    def __init__(self, router: OrderRouter, persistence, market_stream, risk_manager, logger, cfg: Dict[str, Any]):
-
+    def __init__(
+        self,
+        router: OrderRouter,
+        persistence,
+        market_stream,
+        risk_manager,
+        logger=None,
+        kill_switch=None,          # <<< eklendi
+        limits_cfg: Dict[str, Any] = None  # <<< eklendi
+    ):
         self.router = router
         self.persistence = persistence
         self.stream = market_stream
         self.risk = risk_manager
-        self.logger = logger
-        self.cfg = cfg  # config'i sakla
-        self.limits = cfg.get("limits", {})  # limits_cfg yerine doğrudan cfg'den al
+        self.logger = logger or logging.getLogger("order_manager")
+        self.kill_switch = kill_switch
+        self.limits = (limits_cfg or {})
 
-    def _last_price(self, symbol: str) -> Optional[float]:
-        return self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
+    # ---- yardımcılar ----
+    def _count_open(self):
+        total = 0; by_sym = {}; long_n = 0; short_n = 0
+        if hasattr(self.persistence, "list_open_positions"):
+            for p in self.persistence.list_open_positions():
+                total += 1
+                sym = p.get("symbol")
+                side = (p.get("side") or "").upper()
+                by_sym[sym] = by_sym.get(sym, 0) + 1
+                if side == "LONG": long_n += 1
+                elif side == "SHORT": short_n += 1
+        return total, by_sym, long_n, short_n
 
     def _read_limit(self, *names, default=None):
         for n in names:
@@ -31,76 +43,88 @@ class OrderManager:
                 return self.limits[n]
         return default
 
+    def _last_price(self, symbol: str) -> Optional[float]:
+        return self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
 
-    @staticmethod
-    def _extract_entry_fill_price(resp: Dict[str, Any], fallback_price: Optional[float]) -> float:
-        """
-        PAPER/LIVE yanıtlarından "fill price" çıkar. Bulamazsa last_price'a düşer.
-        """
-        # PAPER sim yanıt
-        for k in ("price", "avgPrice", "fillsPrice", "fill_price"):
-            v = resp.get(k)
-            if v:
-                try:
-                    return float(v)
-                except Exception:
-                    pass
-        return float(fallback_price or 0.0)
-
-    
+    # ---- asıl iş ----
     def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
-        intent şeması (esnek):
-        {
-            "action": "entry",
-            "symbol": "SOLUSDT",
-            "side": "BUY" | "SELL",
-            "qty": optional float,
-            "risk_pct": optional float,
-            "order_type": "MARKET" | "LIMIT" | "STOP_MARKET",
-            "price": optional float
-        }
+        intent örneği:
+          { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
+            "qty": optional float, "risk_pct": optional float,
+            "order_type": "MARKET"|"LIMIT"|"STOP_MARKET",
+            "price": optional float }
         """
 
-        # ---- GUARDS ----
+        # Kill-Switch guard
         if self.kill_switch and hasattr(self.kill_switch, "is_trading_allowed") and not self.kill_switch.is_trading_allowed():
             raise RuntimeError("Kill-Switch: trading disabled")
 
+        # Limit guard'ları (geri-uyumlu anahtar isimleriyle)
         total, by_sym, long_n, short_n = self._count_open()
-
         max_open_positions = int(self._read_limit("max_open_positions", "max_open_trades_global", default=0) or 0)
-        max_per_symbol     = int(self._read_limit("max_positions_per_symbol", "max_trades_per_symbol", default=0) or 0)
-        max_longs          = int(self._read_limit("max_longs", "max_long_trades", default=0) or 0)
-        max_shorts         = int(self._read_limit("max_shorts", "max_short_trades", default=0) or 0)
+        max_per_symbol    = int(self._read_limit("max_positions_per_symbol", "max_trades_per_symbol", default=0) or 0)
+        max_longs         = int(self._read_limit("max_longs", "max_long_trades", default=0) or 0)
+        max_shorts        = int(self._read_limit("max_shorts", "max_short_trades", default=0) or 0)
 
         if max_open_positions and total >= max_open_positions:
             raise RuntimeError("Limit: max_open_positions reached")
 
-        sym = intent["symbol"]
-        if max_per_symbol and by_sym.get(sym, 0) >= max_per_symbol:
-            raise RuntimeError(f"Limit: max_positions_per_symbol reached for {sym}")
-
-        side_up = (intent.get("side") or "").upper()
-        if side_up == "BUY" and max_longs and long_n >= max_longs:
+        symbol = intent["symbol"]
+        side = (intent.get("side") or "").upper()
+        if max_per_symbol and by_sym.get(symbol, 0) >= max_per_symbol:
+            raise RuntimeError(f"Limit: max_positions_per_symbol reached for {symbol}")
+        if side == "BUY" and max_longs and long_n >= max_longs:
             raise RuntimeError("Limit: max_longs reached")
-        if side_up == "SELL" and max_shorts and short_n >= max_shorts:
+        if side == "SELL" and max_shorts and short_n >= max_shorts:
             raise RuntimeError("Limit: max_shorts reached")
 
-        # ---- ORDER PREP ----
-        symbol = sym
-        side = side_up
+        # Emir parametreleri
         order_type = intent.get("order_type") or ("MARKET" if "price" not in intent else "LIMIT")
         price = intent.get("price")
 
-        # qty belirleme: önce intent.qty, yoksa risk manager
+        # Miktar hesapla
         qty = float(intent.get("qty") or 0)
         if qty <= 0 and hasattr(self.risk, "position_size"):
             last = self._last_price(symbol)
             qty = float(self.risk.position_size(symbol, side, last_price=last, risk_pct=intent.get("risk_pct")))
         if qty <= 0:
-            raise ValueError("qty hesaplanamadı")
+            # Fallback: per_trade_risk_pct ve stop mesafesi
+            r_cfg = getattr(self.risk, "cfg", {}) if hasattr(self.risk, "cfg") else {}
+            per_risk_pct = float(r_cfg.get("per_trade_risk_pct", 0.2))  # %0.2 varsayılan
+            # equity tahmini
+            equity = 0.0
+            if hasattr(self.persistence, "estimate_account_equity"):
+                equity = float(self.persistence.estimate_account_equity(self._last_price, start_equity_fallback=r_cfg.get("start_equity_usdt", 1000)))
+            risk_amount = max(0.0, equity * per_risk_pct / 100.0)
+            last = self._last_price(symbol) or float(intent.get("price") or 0)
+            if last <= 0 or risk_amount <= 0:
+                raise ValueError("qty hesaplanamadı (price/equity yok)")
+            # stop mesafesi: ATR varsa atr_mult*atr, yoksa step_pct
+            tr_glob = (self.router.cfg.get("trailing") if hasattr(self.router, "cfg") else None) or {}
+            tr_type = (tr_glob.get("type") or "step_pct").lower()
+            atr_period = int(tr_glob.get("atr_period", 14))
+            atr_mult = float(tr_glob.get("atr_mult", 2.5))
+            step_pct = float(tr_glob.get("step_pct", 0.1))
+            atr_val = None
+            get_atr = getattr(self.router, "_trail_ctx", {}).get("get_atr") if hasattr(self.router, "_trail_ctx") else None
+            if callable(get_atr):
+                atr_val = get_atr(symbol, atr_period)
+            if tr_type == "atr" and atr_val and atr_val > 0:
+                stop_dist = atr_mult * atr_val
+            else:
+                stop_dist = last * (step_pct / 100.0)
+            if stop_dist <= 0:
+                raise ValueError("invalid stop distance")
+            qty = risk_amount / stop_dist
 
-        # ---- ORDER EXECUTION ----
+        # --- normalize (istemci katmanı) ---
+        if hasattr(self.router, "normalizer") and self.router.normalizer:
+            n = self.router.normalizer.normalize_order(symbol, side, qty, price, order_type, reduce_only=False)
+            price = n["price"] if price is not None else None
+            qty = n["qty"]
+
+        # Emir gönder
         res = self.router.place_order(
             symbol=symbol,
             side=side,
@@ -111,7 +135,7 @@ class OrderManager:
             tag="entry"
         )
 
-        # ---- CACHE FILL ----
+        # Cache'e yaz
         pos_side = "LONG" if side == "BUY" else "SHORT"
         fill_price = res.get("avgPrice") or res.get("price") or self._last_price(symbol) or price or 0.0
         if hasattr(self.persistence, "cache_add_open_position"):
@@ -119,73 +143,3 @@ class OrderManager:
 
         self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={qty} entry={fill_price}")
         return res
-
-    # ---------------- ENTRY ----------------
-    def open_entry(self, symbol: str, side: str, qty: float, price: float = None, order_type: str = None, tag: str = "entry") -> Dict[str, Any]:
-        """
-        Entry emri atar ve başarıyla atıldıysa cache'e pozisyon ekler/günceller.
-        """
-        side = side.upper()
-        # Router'a emir
-        res = self.router.place_order(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            price=price,
-            order_type=order_type or ("MARKET" if price is None else "LIMIT"),
-            time_in_force=None,
-            reduce_only=False,
-            tag=tag
-        )
-
-        # Fiyat fallback: stream.get_last_price
-        last = self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
-        fill_price = self._extract_entry_fill_price(res, last)
-        filled_qty = self._extract_executed_qty(res, qty)
-
-        # LONG/SHORT belirle
-        pos_side = "LONG" if side == "BUY" else "SHORT"
-
-        # Cache kaydı (pozisyon açıldı)
-        try:
-            if hasattr(self.persistence, "cache_add_open_position"):
-                # Eğer aynı sembolde zaten pozisyon varsa 'update' de gerekebilir; basit tutuyoruz:
-                self.persistence.cache_add_open_position(
-                    symbol=symbol,
-                    side=pos_side,
-                    qty=filled_qty,
-                    entry_price=fill_price
-                )
-            else:
-                self.logger.debug("persistence.cache_add_open_position bulunamadı")
-        except Exception as e:
-            self.logger.warning(f"cache_add_open_position hata: {e}")
-
-        self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={filled_qty} entry={fill_price}")
-        return res
-
-    # ---------------- PARTIAL CLOSE ----------------
-    def partial_close(self, symbol: str, position_side: str, qty: float) -> Dict[str, Any]:
-        position_side = position_side.upper()
-        if position_side not in ("LONG", "SHORT"):
-            raise ValueError("position_side must be LONG or SHORT")
-
-        side_for_order = "SELL" if position_side == "LONG" else "BUY"
-        res = self.router.close_position_market(symbol=symbol, side=side_for_order, qty=qty, tag="partial_close")
-
-        try:
-            if hasattr(self.persistence, "list_open_positions"):
-                for p in self.persistence.list_open_positions():
-                    if p.get("symbol") == symbol:
-                        new_qty = max(0.0, float(p.get("qty", 0)) - float(qty))
-                        if new_qty > 0 and hasattr(self.persistence, "cache_update_position"):
-                            self.persistence.cache_update_position(symbol, qty=new_qty)
-                        elif new_qty == 0 and hasattr(self.persistence, "cache_close_position"):
-                            self.persistence.cache_close_position(symbol)
-                        break
-        except Exception as e:
-            self.logger.warning(f"[PARTIAL CLOSE] cache update error: {e}")
-
-        self.logger.info(f"[PARTIAL CLOSE] {symbol} {position_side} -{qty}")
-        return res
-
