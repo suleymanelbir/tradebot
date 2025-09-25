@@ -27,7 +27,7 @@ from future_trade.klines_cache import KlinesCache
 from future_trade.loops import strat_loop, trailing_loop, kill_switch_loop, daily_reset_loop
 from future_trade.take_profit_manager import TakeProfitManager
 from future_trade.protective_sweeper import ProtectiveSweeper
-
+from future_trade.oco_watcher import OCOWatcher 
 
 
 # (0.1) DEFAULT CONFIG PATH
@@ -247,6 +247,13 @@ async def main() -> None:
         logger=logging.getLogger("tp_manager"),
         orderbook_provider=_orderbook_provider,   # <<< eklendi
     )
+    # 13_1) OCO Watcher’ı başlat
+    oco = OCOWatcher(
+        router=router,
+        persistence=persistence,
+        logger=logging.getLogger("oco_watcher"),
+        interval_sec=5
+    )
 
 #--------------------
     # (opsiyonel) bağlama da ekleyelim
@@ -359,6 +366,25 @@ async def main() -> None:
         tp_task,
         sweeper_task,   # <<< eklendi
     ]
+
+    # 17.9) OCO Watcher — SL ya da TP kaybolduysa diğerini iptal eder (biri tetiklenince diğeri söner)
+    oco_task = asyncio.create_task(
+        oco.run(stop),
+        name="oco_watcher"
+    )
+
+    tasks = [
+        stream_task,
+        klines_task,
+        strat_task,
+        trailing_task,
+        ks_task,
+        ks_reset_task,
+        tp_task,
+        sweeper_task,
+        oco_task,         # <<< eklendi
+    ]
+
 
     # 17.x) Görev seti (iptal/temizlik için referans)
     tasks = [

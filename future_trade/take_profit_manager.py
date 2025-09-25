@@ -254,18 +254,29 @@ class TakeProfitManager:
 
     # -------------------- ana API --------------------
     def upsert_take_profit(self, symbol: str, side_close: str, tp_price: float) -> Optional[Dict[str, Any]]:
+        """
+        Yeni TP hedefi verildiğinde:
+        1) mevcut reduceOnly TAKE_PROFIT* emri bulunur
+        2) replace kriterleri (min_move_pct, debounce_sec) sağlanıyorsa: cancel + yeni TAKE_PROFIT_MARKET
+        3) yoksa yeni TAKE_PROFIT_MARKET direkt gönderilir
+        4) başarılı upsert sonrası TP seviyesi ve orderId cache'e yazılır
+        """
+        # 0) TP yapılandırma parametreleri
         tp_cfg = (self.cfg.get("take_profit") or {})
-        min_move_pct = float(tp_cfg.get("min_move_pct", 0.05))
-        debounce_sec = int(tp_cfg.get("debounce_sec", 15))
+        min_move_pct = float(tp_cfg.get("min_move_pct", 0.05))   # %0.05 default
+        debounce_sec = int(tp_cfg.get("debounce_sec", 15))       # 15s default
 
+        # 1) Giriş doğrulama
         side_close = side_close.upper()
         if side_close not in ("BUY", "SELL"):
             self.logger.error(f"[TP] invalid side_close: {side_close}")
             return None
+
         if tp_price is None or tp_price <= 0:
             self.logger.error(f"[TP] invalid target for {symbol}: {tp_price}")
             return None
 
+        # 2) Mevcut TP emri var mı?
         existed = self._find_existing_tp(symbol, side_close)
         old_tp = 0.0
         if existed:
@@ -274,15 +285,18 @@ class TakeProfitManager:
             except Exception:
                 old_tp = 0.0
 
+        # 3) Kapatılacak miktar (aktif pozisyon)
         qty = self._position_qty_for_close(symbol, side_close)
         if qty <= 0:
             self.logger.debug(f"[TP] no position to protect for {symbol}")
             return None
 
+        # 4) Replace mi, yeni mi?
         do_replace = False
         if existed and old_tp > 0:
             do_replace = self._should_replace(symbol, float(tp_price), old_tp, min_move_pct, debounce_sec)
 
+        # 5) Replace gerekiyorsa eski TP emrini iptal et
         if existed and do_replace:
             try:
                 oid = existed.get("orderId")
@@ -293,6 +307,7 @@ class TakeProfitManager:
             except Exception as e:
                 self.logger.warning(f"[TP] cancel failed for {symbol}: {e}")
 
+        # 6) Yeni TAKE_PROFIT_MARKET emrini gönder
         try:
             res = self.router.place_order(
                 symbol=symbol,
@@ -303,10 +318,34 @@ class TakeProfitManager:
                 reduce_only=True,
                 tag="TP"
             )
+
+            # 6.1) orderId bilgisini al
+            order_id = None
+            try:
+                order_id = str(res.get("orderId") or res.get("order_id") or "")
+            except Exception:
+                order_id = None
+
+            # 6.2) zaman damgası ve log
             self._last_upsert_ts[symbol] = time.time()
             self.logger.info(f"[TP] upsert {symbol} {side_close} tp={tp_price} qty={qty} replace={bool(existed and do_replace)}")
+
+            # 6.3) cache: TP seviyesi ve orderId
+            if hasattr(self.persistence, "cache_update_tp"):
+                try:
+                    self.persistence.cache_update_tp(symbol, float(tp_price))
+                except Exception:
+                    pass
+
+            if hasattr(self.persistence, "cache_update_tp_order_id") and order_id:
+                try:
+                    self.persistence.cache_update_tp_order_id(symbol, order_id)
+                except Exception:
+                    pass
+
             return res
         except Exception as e:
+            # 7) Emir gönderimi başarısızsa logla
             self.logger.error(f"[TP] upsert failed for {symbol}: {e}")
             return None
 

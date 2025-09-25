@@ -50,17 +50,17 @@ class OrderManager:
     def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
         intent örneği:
-          { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
+        { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
             "qty": optional float, "risk_pct": optional float,
             "order_type": "MARKET"|"LIMIT"|"STOP_MARKET",
             "price": optional float }
         """
 
-        # Kill-Switch guard
+        # 1) Kill-Switch kontrolü
         if self.kill_switch and hasattr(self.kill_switch, "is_trading_allowed") and not self.kill_switch.is_trading_allowed():
             raise RuntimeError("Kill-Switch: trading disabled")
 
-        # Limit guard'ları (geri-uyumlu anahtar isimleriyle)
+        # 2) Limit kontrolleri
         total, by_sym, long_n, short_n = self._count_open()
         max_open_positions = int(self._read_limit("max_open_positions", "max_open_trades_global", default=0) or 0)
         max_per_symbol    = int(self._read_limit("max_positions_per_symbol", "max_trades_per_symbol", default=0) or 0)
@@ -79,20 +79,19 @@ class OrderManager:
         if side == "SELL" and max_shorts and short_n >= max_shorts:
             raise RuntimeError("Limit: max_shorts reached")
 
-        # Emir parametreleri
+        # 3) Emir parametreleri
         order_type = intent.get("order_type") or ("MARKET" if "price" not in intent else "LIMIT")
         price = intent.get("price")
 
-        # Miktar hesapla
+        # 4) Miktar hesaplama
         qty = float(intent.get("qty") or 0)
         if qty <= 0 and hasattr(self.risk, "position_size"):
             last = self._last_price(symbol)
             qty = float(self.risk.position_size(symbol, side, last_price=last, risk_pct=intent.get("risk_pct")))
         if qty <= 0:
-            # Fallback: per_trade_risk_pct ve stop mesafesi
+            # Fallback hesaplama: equity ve stop mesafesi
             r_cfg = getattr(self.risk, "cfg", {}) if hasattr(self.risk, "cfg") else {}
-            per_risk_pct = float(r_cfg.get("per_trade_risk_pct", 0.2))  # %0.2 varsayılan
-            # equity tahmini
+            per_risk_pct = float(r_cfg.get("per_trade_risk_pct", 0.2))
             equity = 0.0
             if hasattr(self.persistence, "estimate_account_equity"):
                 equity = float(self.persistence.estimate_account_equity(self._last_price, start_equity_fallback=r_cfg.get("start_equity_usdt", 1000)))
@@ -100,7 +99,6 @@ class OrderManager:
             last = self._last_price(symbol) or float(intent.get("price") or 0)
             if last <= 0 or risk_amount <= 0:
                 raise ValueError("qty hesaplanamadı (price/equity yok)")
-            # stop mesafesi: ATR varsa atr_mult*atr, yoksa step_pct
             tr_glob = (self.router.cfg.get("trailing") if hasattr(self.router, "cfg") else None) or {}
             tr_type = (tr_glob.get("type") or "step_pct").lower()
             atr_period = int(tr_glob.get("atr_period", 14))
@@ -118,13 +116,13 @@ class OrderManager:
                 raise ValueError("invalid stop distance")
             qty = risk_amount / stop_dist
 
-        # --- normalize (istemci katmanı) ---
+        # 5) Normalize işlemi
         if hasattr(self.router, "normalizer") and self.router.normalizer:
             n = self.router.normalizer.normalize_order(symbol, side, qty, price, order_type, reduce_only=False)
             price = n["price"] if price is not None else None
             qty = n["qty"]
 
-        # Emir gönder
+        # 6) Emir gönderimi
         res = self.router.place_order(
             symbol=symbol,
             side=side,
@@ -135,11 +133,32 @@ class OrderManager:
             tag="entry"
         )
 
-        # Cache'e yaz
+        # 7) ENTRY sonrası pozisyonu cache'e yaz
         pos_side = "LONG" if side == "BUY" else "SHORT"
         fill_price = res.get("avgPrice") or res.get("price") or self._last_price(symbol) or price or 0.0
         if hasattr(self.persistence, "cache_add_open_position"):
             self.persistence.cache_add_open_position(symbol, pos_side, qty, float(fill_price))
 
+        # 8) ENTRY log kaydı
         self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={qty} entry={fill_price}")
+
+        # 9) KISMİ KAPANIŞ kontrolü (örnek: pozisyon zaten vardı ve miktar azaldıysa)
+        if hasattr(self.persistence, "cache_update_position"):
+            try:
+                old_qty = self._get_cached_qty(symbol)
+                closed_qty = max(0.0, old_qty - qty)
+                if closed_qty > 0 and qty < old_qty:
+                    new_qty = max(0.0, old_qty - closed_qty)
+                    self.persistence.cache_update_position(symbol, qty=new_qty)
+            except Exception:
+                pass
+
+        # 10) TAM KAPANIŞ kontrolü (örnek: pozisyon sıfırlandıysa)
+        if hasattr(self.persistence, "cache_close_position"):
+            try:
+                if qty <= 0:
+                    self.persistence.cache_close_position(symbol)
+            except Exception:
+                pass
+
         return res

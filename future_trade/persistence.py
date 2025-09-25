@@ -1,14 +1,36 @@
-"""SQLite kalıcılık (futures_data.db)
+# /opt/tradebot/future_trade/persistence.py
+# -*- coding: utf-8 -*-
+"""
+SQLite kalıcılık (futures_data.db)
 - Şema oluşturma + hafif migration
 - Yardımcı operasyonlar: pozisyon/sipariş/trade/state/sinyal
 """
-import sqlite3, json, time, logging
-from typing import Any, Dict, Optional, Iterable, List
-from .order_router import OrderRouter
+from __future__ import annotations
 
+import json
+import logging
+import sqlite3
+import time
+
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Sadece type checker için import; çalışma zamanında import edilmez
+    from .order_router import OrderRouter
+
+# ---------- Yardımcı ----------
 def now_ts() -> int:
     return int(time.time())
 
+
+PRAGMAS = [
+    "PRAGMA journal_mode=WAL;",
+    "PRAGMA synchronous=NORMAL;",
+    "PRAGMA foreign_keys=ON;",
+]
+
+
+# ---------- Kanonik Şema ----------
 SCHEMA = [
     # Klines
     """
@@ -29,7 +51,7 @@ SCHEMA = [
         extra_json TEXT
     );
     """,
-    # Positions (ONE-WAY per symbol mantığına uygun)
+    # Positions (ONE-WAY per symbol)
     """
     CREATE TABLE IF NOT EXISTS futures_positions (
         symbol TEXT PRIMARY KEY,
@@ -37,7 +59,7 @@ SCHEMA = [
         unrealized_pnl REAL, updated_at INTEGER
     );
     """,
-    # Trades (taker/maker, realized pnl vs.)
+    # Trades
     """
     CREATE TABLE IF NOT EXISTS futures_trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,8 +67,7 @@ SCHEMA = [
         price REAL, qty REAL, fee REAL, realized_pnl REAL, ts INTEGER
     );
     """,
-    # State (KANONİK): cooldown_until_ts + last_exit_ts dahil
-    # Not: eski tabloda cooldown_until kolonu olabilir. Aşağıda migration ile taşınır.
+    # State (KANONİK) — cooldown_until_ts kullan
     """
     CREATE TABLE IF NOT EXISTS symbol_state (
         symbol TEXT PRIMARY KEY,
@@ -84,21 +105,19 @@ SCHEMA = [
     """
     CREATE INDEX IF NOT EXISTS idx_signal_audit_ts_symbol
         ON signal_audit(ts, symbol);
-    """
+    """,
 ]
 
-PRAGMAS = [
-    "PRAGMA journal_mode=WAL;",
-    "PRAGMA synchronous=NORMAL;",
-    "PRAGMA foreign_keys=ON;"
-]
 
 class Persistence:
-    def __init__(self, path: str, router: OrderRouter, logger):
+    def __init__(self, path: str, router: Optional["OrderRouter"], logger: logging.Logger):
         self.path = path
         self.router = router
-        self.logger = logger
+        self.logger = logger or logging.getLogger("db")
+        # RAM cache (opsiyonel kullanım için hazır dursun)
+        self._open_positions_cache: List[Dict[str, Any]] = []
 
+    # --------------------------- Connection helper ---------------------------
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
@@ -109,34 +128,41 @@ class Persistence:
                 pass
         return conn
 
-    # --------------------------- Schema & Migration ---------------------------
-
-    def init_schema(self):
+    # --------------------------- Schema & Migration --------------------------
+    def init_schema(self) -> None:
+        """
+        Veritabanı şemasını başlatır:
+        - SCHEMA içeriğini uygular
+        - cooldown_until (eski) → cooldown_until_ts (yeni) değerini taşır (varsa)
+        - positions_cache tablosunu oluşturur
+        - updated_at kolonlarını makul değerlere çeker
+        - positions_cache tablosuna sl_order_id / tp_order_id kolonlarını ekler (varsa)
+        """
         with self._conn() as c:
             cur = c.cursor()
+
+            # 1) Ana şemalar
             for stmt in SCHEMA:
                 cur.executescript(stmt)
 
-            # --- MIGRATION: eski 'cooldown_until' → yeni 'cooldown_until_ts' ---
-            cur.execute("PRAGMA table_info(symbol_state)")
-            cols = {row[1] for row in cur.fetchall()}
-
-            # Eski kolon varsa ve yenisi de varsa, taşımayı yap
-            if "cooldown_until" in cols and "cooldown_until_ts" in cols:
-                try:
+            # 2) Migration: eski `cooldown_until` değerlerini `cooldown_until_ts`'e kopyala (kolon varsa)
+            try:
+                cur.execute("PRAGMA table_info(symbol_state)")
+                cols = {row[1] for row in cur.fetchall()}
+                if "cooldown_until" in cols and "cooldown_until_ts" in cols:
                     cur.execute("""
                         UPDATE symbol_state
                         SET cooldown_until_ts =
                             CASE
-                                WHEN (cooldown_until_ts IS NULL OR cooldown_until_ts = 0)
-                                THEN COALESCE(cooldown_until, 0)
+                                WHEN COALESCE(cooldown_until_ts,0)=0
+                                THEN COALESCE(cooldown_until,0)
                                 ELSE cooldown_until_ts
                             END
                     """)
-                except Exception as e:
-                    logging.debug(f"cooldown migration skip: {e}")
+            except Exception as e:
+                self.logger.debug(f"cooldown migration skipped: {e}")
 
-            # Güvenlik: son olarak updated_at kolonunu güncel şemaya uygun tut
+            # 3) updated_at kolonlarını normalize et
             try:
                 cur.execute("""
                     UPDATE symbol_state
@@ -146,56 +172,130 @@ class Persistence:
             except Exception:
                 pass
 
+            # 4) Yeni tablo: positions_cache (KANONİK)
+            try:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS positions_cache (
+                        symbol TEXT PRIMARY KEY,
+                        side TEXT,
+                        qty REAL,
+                        entry_price REAL,
+                        sl REAL,
+                        tp REAL,
+                        updated_at INTEGER
+                    )
+                """)
+            except Exception as e:
+                self.logger.warning(f"positions_cache creation failed: {e}")
+
+            # 4.1) positions_cache: sl_order_id / tp_order_id kolonlarını ekle (yoksa)
+            try:
+                cur.execute("PRAGMA table_info(positions_cache)")
+                cols = {row[1] for row in cur.fetchall()}
+                if "sl_order_id" not in cols:
+                    cur.execute("ALTER TABLE positions_cache ADD COLUMN sl_order_id TEXT")
+                if "tp_order_id" not in cols:
+                    cur.execute("ALTER TABLE positions_cache ADD COLUMN tp_order_id TEXT")
+            except Exception as e:
+                self.logger.debug(f"positions_cache add columns skipped: {e}")
+
+            # 5) Commit işlemi
             c.commit()
 
-    # --------------------------- Signal Audit ---------------------------
+    # --------------------------- Helpers -------------------------------------
+    @staticmethod
+    def _utc() -> int:
+        return int(time.time())
 
-    def record_signal_audit(self, event: Dict[str, Any], signal, decision: bool, reason: Optional[str] = None):
+    # --------------------------- Signal Audit ---------------------------------
+    def record_signal_audit(self, event: Dict[str, Any], signal, decision: bool, reason: Optional[str] = None) -> None:
         with self._conn() as c:
             c.execute(
                 "INSERT INTO signal_audit VALUES (?,?,?,?,?)",
-                (int(time.time()), event.get("symbol"), getattr(signal, "side", None),
-                 int(bool(decision)), json.dumps({"reason": reason}, ensure_ascii=False))
+                (
+                    int(time.time()),
+                    event.get("symbol"),
+                    getattr(signal, "side", None),
+                    int(bool(decision)),
+                    json.dumps({"reason": reason}, ensure_ascii=False),
+                ),
             )
             c.commit()
 
-    # --------------------------- Symbol State ---------------------------
-
+    # --------------------------- Symbol State (cooldown_ts std) ---------------
     def set_cooldown(self, symbol: str, until_ts: int) -> None:
+        """
+        Artık yalnızca cooldown_until_ts kolonunu kullanıyoruz (KANONİK).
+        """
         with self._conn() as c:
-            c.execute("""
-            INSERT INTO symbol_state(symbol, cooldown_until, updated_at)
-            VALUES(?,?,?)
-            ON CONFLICT(symbol) DO UPDATE SET cooldown_until=excluded.cooldown_until, updated_at=excluded.updated_at
-            """, (symbol, int(until_ts), int(time.time())))
+            c.execute(
+                """
+                INSERT INTO symbol_state(symbol, cooldown_until_ts, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    cooldown_until_ts=excluded.cooldown_until_ts,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, int(until_ts), now_ts()),
+            )
             c.commit()
 
-    def get_cooldown(self, symbol: str) -> int:
+    def get_cooldown_ts(self, symbol: str) -> int:
+        """
+        Kalan süre hesaplarında kullanılacak epoch (yoksa 0).
+        Eski kolon (cooldown_until) varsa GERİYE UYUMLU olarak onu da dener.
+        """
         with self._conn() as c:
-            cur = c.cursor()
-            cur.execute("SELECT cooldown_until FROM symbol_state WHERE symbol=?", (symbol,))
+            cur = c.execute("SELECT cooldown_until_ts FROM symbol_state WHERE symbol=?", (symbol,))
             row = cur.fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
+            if row and row[0]:
+                return int(row[0])
+            # backward-compat: eski kolon
+            try:
+                cur = c.execute("SELECT cooldown_until FROM symbol_state WHERE symbol=?", (symbol,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return int(row[0])
+            except sqlite3.OperationalError:
+                pass
+            return 0
 
-    def mark_exit_ts(self, symbol: str, ts: int) -> None:
+    def get_cooldown_remaining(self, symbol: str, now_epoch: Optional[int] = None) -> int:
+        if now_epoch is None:
+            now_epoch = now_ts()
+        remain = self.get_cooldown_ts(symbol) - now_epoch
+        return int(remain) if remain > 0 else 0
+
+    # Deprecated (geriye uyum)
+    def get_cooldown(self, symbol: str) -> int:
+        return self.get_cooldown_ts(symbol)
+
+    def set_last_signal_ts(self, symbol: str, ts: int) -> None:
         with self._conn() as c:
-            c.execute("""
-            INSERT INTO symbol_state(symbol, last_signal_ts, updated_at)
-            VALUES(?,?,?)
-            ON CONFLICT(symbol) DO UPDATE SET last_signal_ts=excluded.last_signal_ts, updated_at=excluded.updated_at
-            """, (symbol, int(ts), int(time.time())))
+            c.execute(
+                """
+                INSERT INTO symbol_state(symbol, last_signal_ts, updated_at)
+                VALUES(?, ?, strftime('%s','now'))
+                ON CONFLICT(symbol) DO UPDATE SET
+                    last_signal_ts=excluded.last_signal_ts,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, int(ts)),
+            )
             c.commit()
-
 
     def set_trail_stop(self, symbol: str, value: Optional[float]) -> None:
         with self._conn() as c:
-            c.execute("""
+            c.execute(
+                """
                 INSERT INTO symbol_state(symbol, trail_stop, updated_at)
                 VALUES(?, ?, strftime('%s','now'))
-                ON CONFLICT(symbol)
-                DO UPDATE SET trail_stop=excluded.trail_stop,
-                              updated_at=excluded.updated_at
-            """, (symbol, None if value is None else float(value)))
+                ON CONFLICT(symbol) DO UPDATE SET
+                    trail_stop=excluded.trail_stop,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, None if value is None else float(value)),
+            )
             c.commit()
 
     def get_trail_stop(self, symbol: str) -> Optional[float]:
@@ -203,17 +303,6 @@ class Persistence:
             cur = c.execute("SELECT trail_stop FROM symbol_state WHERE symbol=?", (symbol,))
             row = cur.fetchone()
             return float(row[0]) if row and row[0] is not None else None
-    
-    def set_last_signal_ts(self, symbol: str, ts: int) -> None:
-        with self._conn() as c:
-            c.execute("""
-                INSERT INTO symbol_state(symbol, last_signal_ts, updated_at)
-                VALUES(?, ?, strftime('%s','now'))
-                ON CONFLICT(symbol)
-                DO UPDATE SET last_signal_ts=excluded.last_signal_ts,
-                              updated_at=excluded.updated_at
-            """, (symbol, int(ts)))
-            c.commit()
 
     def get_symbol_state(self, symbol: str) -> Dict[str, Any]:
         with self._conn() as c:
@@ -221,20 +310,22 @@ class Persistence:
             row = cur.fetchone()
             return dict(row) if row else {}
 
-    # --------------------------- Positions ---------------------------
-
+    # --------------------------- Positions (futures_positions) ----------------
     def upsert_position(self, symbol: str, side: str, qty: float, entry_price: float, leverage: int = 1) -> None:
         with self._conn() as c:
-            c.execute("""
+            c.execute(
+                """
                 INSERT INTO futures_positions(symbol, side, qty, entry_price, leverage, unrealized_pnl, updated_at)
                 VALUES(?,?,?,?,?,0,?)
                 ON CONFLICT(symbol) DO UPDATE SET
-                  side=excluded.side,
-                  qty=excluded.qty,
-                  entry_price=excluded.entry_price,
-                  leverage=excluded.leverage,
-                  updated_at=excluded.updated_at
-            """, (symbol, side, float(qty), float(entry_price), int(leverage), now_ts()))
+                    side=excluded.side,
+                    qty=excluded.qty,
+                    entry_price=excluded.entry_price,
+                    leverage=excluded.leverage,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, side, float(qty), float(entry_price), int(leverage), now_ts()),
+            )
             c.commit()
 
     def delete_position(self, symbol: str) -> None:
@@ -249,17 +340,16 @@ class Persistence:
 
     def get_open_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._conn() as c:
-            c.row_factory = sqlite3.Row
-            cur = c.cursor()
-            cur.execute("SELECT side, qty FROM futures_positions WHERE symbol=? AND ABS(qty) > 0", (symbol,))
+            cur = c.execute(
+                "SELECT side, qty, entry_price FROM futures_positions WHERE symbol=? AND ABS(qty) > 0",
+                (symbol,),
+            )
             row = cur.fetchone()
             return dict(row) if row else None
 
-
-
     def close_position(self, symbol: str) -> None:
         """
-        Pozisyonu router üzerinden kapat, ardından deftere yaz.
+        Pozisyonu router üzerinden kapat, ardından defter ve cache'i güncelle.
         """
         pos = self.get_open_position(symbol)
         if not pos:
@@ -267,186 +357,148 @@ class Persistence:
             return
 
         qty = abs(float(pos["qty"]))
-        side = "SELL" if pos["side"].upper() == "LONG" else "BUY"
+        side_close = "SELL" if str(pos["side"]).upper() == "LONG" else "BUY"
 
         try:
-            # 1) Router üzerinden pozisyonu kapat
-            self.router.close_position_market(symbol=symbol, side=side, qty=qty, tag="persist_close")
-            self.logger.info(f"[PERSISTENCE] Router ile pozisyon kapatıldı: {symbol} {side} {qty}")
-
-            # 2) Veritabanında pozisyonu sıfırla ve sembol durumunu güncelle
-            with self._conn() as c:
-                c.execute("UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?", (now_ts(), symbol))
-                c.execute("""
-                INSERT INTO symbol_state(symbol, state, cooldown_until, last_signal_ts, trail_stop, peak, trough, updated_at)
-                VALUES(?, COALESCE((SELECT state FROM symbol_state WHERE symbol=?), ''), 0, COALESCE((SELECT last_signal_ts FROM symbol_state WHERE symbol=?), 0), NULL, NULL, NULL, ?)
-                ON CONFLICT(symbol) DO UPDATE SET updated_at=excluded.updated_at
-                """, (symbol, symbol, symbol, now_ts()))
-                c.commit()
-
+            if self.router:
+                self.router.close_position_market(symbol=symbol, side=side_close, qty=qty, tag="persist_close")
+                self.logger.info(f"[PERSISTENCE] Router ile pozisyon kapatıldı: {symbol} {side_close} {qty}")
         except Exception as e:
-            self.logger.error(f"[PERSISTENCE] Pozisyon kapama hatası: {symbol} {e}")
+            self.logger.error(f"[PERSISTENCE] Router close error: {symbol} {e}")
 
+        # DB: futures_positions → qty=0 ; cache → sil
+        with self._conn() as c:
+            c.execute("UPDATE futures_positions SET qty=0, updated_at=? WHERE symbol=?", (now_ts(), symbol))
+            c.commit()
+        self.cache_close_position(symbol)
 
-    def list_open_positions(self):
+    # --------------------------- Positions Cache (KANONİK) --------------------
+    def cache_add_open_position(self, symbol: str, side: str, qty: float, entry_price: float) -> None:
+        side = (side or "").upper()
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO positions_cache(symbol, side, qty, entry_price, sl, tp, updated_at)
+                VALUES(?,?,?,?,NULL,NULL,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    side=excluded.side,
+                    qty=excluded.qty,
+                    entry_price=excluded.entry_price,
+                    updated_at=excluded.updated_at
+                """,
+                (symbol, side, float(qty), float(entry_price), self._utc()),
+            )
+            c.commit()
+
+    def cache_update_position(
+        self,
+        symbol: str,
+        qty: float | None = None,
+        entry_price: float | None = None,
+        sl: float | None = None,
+        tp: float | None = None,
+    ) -> None:
         """
-        Açık pozisyonları [{symbol, side, qty, entry_price, ...}, ...] döndürür.
-        Şimdilik hafıza içi cache'den okur.
+        Pozisyonu veritabanında günceller. Sadece verilen alanlar değiştirilir.
         """
-        self.init_open_positions_cache()
-        return list(self._open_positions_cache)
-
-    def position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
-        with self._conn() as c:
-            cur = c.execute("SELECT * FROM futures_positions WHERE symbol=?", (symbol,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-    # --------------------------- Orders & Trades ---------------------------
-
-    def record_order(self, client_id: str, symbol: str, side: str, typ: str, status: str,
-                     price: float, qty: float, reduce_only: bool, extra_json: Optional[Dict[str, Any]] = None) -> None:
-        with self._conn() as c:
-            c.execute("""
-                INSERT INTO futures_orders(client_id, symbol, side, type, status, price, qty, reduce_only, created_at, updated_at, extra_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """, (client_id, symbol, side, typ, status, float(price), float(qty), 1 if reduce_only else 0, now_ts(), now_ts(),
-                  json.dumps(extra_json or {}, ensure_ascii=False)))
-            c.commit()
-
-    def update_order_status(self, client_id: str, status: str,
-                            price: Optional[float] = None,
-                            qty: Optional[float] = None,
-                            extra: Optional[Dict[str, Any]] = None) -> None:
-        now = int(time.time())
-        sets, vals = ["status=?","updated_at=?"], [status, now]
-        if price is not None:
-            sets.append("price=?"); vals.append(float(price))
-        if qty is not None:
-            sets.append("qty=?"); vals.append(float(qty))
-        if extra is not None:
-            sets.append("extra_json=?"); vals.append(json.dumps(extra, ensure_ascii=False))
-        vals.append(client_id)
-        sql = f"UPDATE futures_orders SET {', '.join(sets)} WHERE client_id=?"
-        with self._conn() as c:
-            c.execute(sql, vals)
-            c.commit()
-
-    def record_trade(self, order_id: int, symbol: str, side: str, price: float,
-                     qty: float, fee: float = 0.0, realized_pnl: float = 0.0, ts: Optional[int] = None) -> int:
-        ts = int(ts or time.time())
-        with self._conn() as c:
-            cur = c.execute("""
-                INSERT INTO futures_trades(order_id, symbol, side, price, qty, fee, realized_pnl, ts)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            """, (int(order_id), symbol, side, float(price), float(qty), float(fee), float(realized_pnl), ts))
-            c.commit()
-            return int(cur.lastrowid)
-
-    # --------------------------- Klines ---------------------------
-
-    def record_kline(self, symbol: str, tf: str, open_time: int, o: float, h: float, l: float, c_: float,
-                     v: float, close_time: int) -> None:
-        with self._conn() as c:
-            c.execute("""
-                INSERT OR REPLACE INTO futures_klines(symbol, tf, open_time, open, high, low, close, volume, close_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, tf, int(open_time), float(o), float(h), float(l), float(c_), float(v), int(close_time)))
-            c.commit()
-
-    # --- ekleme: net isimli getter'lar ---
-    def get_cooldown_ts(self, symbol: str) -> int:
-        """Cooldown epoch (yoksa 0)."""
-        with self._conn() as c:
-            cur = c.execute("SELECT cooldown_until_ts FROM symbol_state WHERE symbol=?", (symbol,))
-            row = cur.fetchone()
-            if row and row[0]:
-                return int(row[0])
-            # backward-compat: eski kolon varsa
-            try:
-                cur = c.execute("SELECT cooldown_until FROM symbol_state WHERE symbol=?", (symbol,))
-                row = cur.fetchone()
-                if row and row[0]:
-                    return int(row[0])
-            except sqlite3.OperationalError:
-                pass
-            return 0
-
-    def get_cooldown_remaining(self, symbol: str, now_ts: Optional[int] = None) -> int:
-        """Kalan cooldown saniyesi; yoksa 0."""
-        if now_ts is None:
-            now_ts = int(time.time())
-        until = self.get_cooldown_ts(symbol)
-        remain = until - now_ts
-        return remain if remain > 0 else 0
-
-    # --- mevcut get_cooldown'u koruyalım ama yönlendirelim ---
-    def get_cooldown(self, symbol: str) -> int:
-        """DEPRECATED: epoch döndürür. Yeni kullanım için get_cooldown_ts/get_cooldown_remaining."""
-        return self.get_cooldown_ts(symbol)
-
-    # --- temizlik: süresi dolmuş cooldown'ları sıfırla ---
-    def clear_expired_cooldowns(self, now_ts: Optional[int] = None) -> int:
-        if now_ts is None:
-            now_ts = int(time.time())
         with self._conn() as c:
             cur = c.cursor()
-            cur.execute("""
-                UPDATE symbol_state
-                SET cooldown_until_ts=0, updated_at=strftime('%s','now')
-                WHERE COALESCE(cooldown_until_ts,0) > 0 AND cooldown_until_ts < ?
-            """, (int(now_ts),))
+            cur.execute(
+                "SELECT symbol, side, qty, entry_price, sl, tp FROM positions_cache WHERE symbol=?",
+                (symbol,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            _, side0, qty0, entry0, sl0, tp0 = row
+            new_qty = float(qty) if qty is not None else qty0
+            new_entry = float(entry_price) if entry_price is not None else entry0
+            new_sl = float(sl) if sl is not None else sl0
+            new_tp = float(tp) if tp is not None else tp0
+            c.execute(
+                """
+                UPDATE positions_cache
+                   SET qty=?,
+                       entry_price=?,
+                       sl=?,
+                       tp=?,
+                       updated_at=?
+                 WHERE symbol=?
+                """,
+                (new_qty, new_entry, new_sl, new_tp, self._utc(), symbol),
+            )
             c.commit()
-            return cur.rowcount
 
-    def recent_orders(self, symbol: str, limit: int = 20) -> list[dict]:
+    def cache_update_sl(self, symbol: str, sl: float | None) -> None:
         with self._conn() as c:
-            cur = c.execute("""
-                SELECT * FROM futures_orders
-                WHERE symbol=?
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (symbol, int(limit)))
-            return [dict(r) for r in cur.fetchall()]
+            c.execute(
+                "UPDATE positions_cache SET sl=?, updated_at=? WHERE symbol=?",
+                (float(sl) if sl is not None else None, self._utc(), symbol),
+            )
+            c.commit()
 
-    def open_positions_by_side(self) -> dict:
-        """{'LONG': n, 'SHORT': m}"""
-        out = {'LONG': 0, 'SHORT': 0}
-        for p in self.open_positions():
-            side = str(p.get('side') or '').upper()
-            if side in out:
-                out[side] += 1
+    def cache_update_tp(self, symbol: str, tp: float | None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE positions_cache SET tp=?, updated_at=? WHERE symbol=?",
+                (float(tp) if tp is not None else None, self._utc(), symbol),
+            )
+            c.commit()
+
+    def cache_close_position(self, symbol: str) -> None:
+        """
+        Pozisyon tamamen kapandığında cache'ten sil.
+        """
+        with self._conn() as c:
+            c.execute("DELETE FROM positions_cache WHERE symbol=?", (symbol,))
+            c.commit()
+        # RAM cache’te de varsa temizle
+        self._open_positions_cache = [p for p in self._open_positions_cache if p.get("symbol") != symbol]
+
+    def list_open_positions(self) -> List[Dict[str, Any]]:
+        """
+        Açık pozisyonları DB cache’ten döndürür.
+        Format: [{symbol, side, qty, entry_price, sl, tp, updated_at, sl_order_id, tp_order_id}, ...]
+        """
+        out: List[Dict[str, Any]] = []
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                SELECT symbol, side, qty, entry_price, sl, tp, updated_at, sl_order_id, tp_order_id
+                FROM positions_cache
+                WHERE qty IS NOT NULL AND ABS(qty) > 0
+                """
+            )
+            for r in cur.fetchall():
+                out.append(
+                    {
+                        "symbol": r["symbol"],
+                        "side": (r["side"] or "").upper(),
+                        "qty": float(r["qty"] or 0.0),
+                        "entry_price": float(r["entry_price"] or 0.0),
+                        "sl": float(r["sl"]) if r["sl"] is not None else None,
+                        "tp": float(r["tp"]) if r["tp"] is not None else None,
+                        "updated_at": int(r["updated_at"] or 0),
+                        "sl_order_id": r["sl_order_id"],
+                        "tp_order_id": r["tp_order_id"],
+                    }
+                )
         return out
 
+        def cache_update_sl_order_id(self, symbol: str, order_id: str | None) -> None:
+            with self._conn() as c:
+                c.execute("UPDATE positions_cache SET sl_order_id=?, updated_at=? WHERE symbol=?",
+                        (order_id, self._utc(), symbol))
+                c.commit()
 
-    def init_open_positions_cache(self) -> None:
-        if not hasattr(self, "_open_positions_cache"):
-            # [{symbol, side, qty, entry_price, ...}]
-            self._open_positions_cache = []
+        def cache_update_tp_order_id(self, symbol: str, order_id: str | None) -> None:
+            with self._conn() as c:
+                c.execute("UPDATE positions_cache SET tp_order_id=?, updated_at=? WHERE symbol=?",
+                        (order_id, self._utc(), symbol))
+                c.commit()
 
-    def cache_add_open_position(self, symbol: str, side: str, qty: float, entry_price: float, **extras) -> None:
-        self.init_open_positions_cache()
-        side = (side or "").upper()
-        # Aynı sembolde tek pozisyon varsayımı (ONE_WAY), varsa güncelle
-        for p in self._open_positions_cache:
-            if p.get("symbol") == symbol:
-                p["side"] = side
-                p["qty"] = float(qty)
-                p["entry_price"] = float(entry_price)
-                if extras:
-                    p.update(extras)
-                break
-        else:
-            self._open_positions_cache.append({
-                "symbol": symbol,
-                "side": side,
-                "qty": float(qty),
-                "entry_price": float(entry_price),
-                **extras
-            })
-        
-    def cache_update_position(self, symbol: str, qty: float = None, entry_price: float = None, **extras) -> None:
-        self.init_open_positions_cache()
+    # ---- (opsiyonel) yalnız RAM içi mini güncelleme: adı net olsun
+    def cache_update_position_mem(self, symbol: str, qty: float | None = None, entry_price: float | None = None, **extras) -> None:
         for p in self._open_positions_cache:
             if p.get("symbol") == symbol:
                 if qty is not None:
@@ -456,25 +508,166 @@ class Persistence:
                 if extras:
                     p.update(extras)
                 break
-            
-    def cache_close_position(self, symbol: str) -> None:
-        """
-        Pozisyon tamamen kapandığında cache'ten çıkar.
-        """
-        self.init_open_positions_cache()
-        self._open_positions_cache = [p for p in self._open_positions_cache if p.get("symbol") != symbol]
 
-    # --- Günlük PnL ve equity tahmini için yardımcılar ---
+    # --------------------------- Orders & Trades ------------------------------
+    def record_order(
+        self,
+        client_id: str,
+        symbol: str,
+        side: str,
+        typ: str,
+        status: str,
+        price: float,
+        qty: float,
+        reduce_only: bool,
+        extra_json: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO futures_orders(client_id, symbol, side, type, status, price, qty, reduce_only, created_at, updated_at, extra_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    client_id,
+                    symbol,
+                    side,
+                    typ,
+                    status,
+                    float(price),
+                    float(qty),
+                    1 if reduce_only else 0,
+                    now_ts(),
+                    now_ts(),
+                    json.dumps(extra_json or {}, ensure_ascii=False),
+                ),
+            )
+            c.commit()
 
-    def record_close(self, symbol: str, side: str, entry_price: float, exit_price: float, qty: float, pnl: float) -> None:
+    def update_order_status(
+        self,
+        client_id: str,
+        status: str,
+        price: Optional[float] = None,
+        qty: Optional[float] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        sets, vals = ["status=?", "updated_at=?"], [status, now_ts()]
+        if price is not None:
+            sets.append("price=?")
+            vals.append(float(price))
+        if qty is not None:
+            sets.append("qty=?")
+            vals.append(float(qty))
+        if extra is not None:
+            sets.append("extra_json=?")
+            vals.append(json.dumps(extra, ensure_ascii=False))
+        vals.append(client_id)
+        sql = f"UPDATE futures_orders SET {', '.join(sets)} WHERE client_id=?"
+        with self._conn() as c:
+            c.execute(sql, vals)
+            c.commit()
+
+    def record_trade(
+        self,
+        order_id: int,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        fee: float = 0.0,
+        realized_pnl: float = 0.0,
+        ts: Optional[int] = None,
+    ) -> int:
+        ts = int(ts or now_ts())
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                INSERT INTO futures_trades(order_id, symbol, side, price, qty, fee, realized_pnl, ts)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (int(order_id), symbol, side, float(price), float(qty), float(fee), float(realized_pnl), ts),
+            )
+            c.commit()
+            return int(cur.lastrowid)
+
+    # --------------------------- Klines ---------------------------------------
+    def record_kline(
+        self,
+        symbol: str,
+        tf: str,
+        open_time: int,
+        o: float,
+        h: float,
+        l: float,
+        c_: float,
+        v: float,
+        close_time: int,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO futures_klines(symbol, tf, open_time, open, high, low, close, volume, close_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, tf, int(open_time), float(o), float(h), float(l), float(c_), float(v), int(close_time)),
+            )
+            c.commit()
+
+    # --------------------------- Misc helpers ---------------------------------
+    def clear_expired_cooldowns(self, now_epoch: Optional[int] = None) -> int:
+        if now_epoch is None:
+            now_epoch = now_ts()
+        with self._conn() as c:
+            cur = c.cursor()
+            cur.execute(
+                """
+                UPDATE symbol_state
+                   SET cooldown_until_ts=0, updated_at=strftime('%s','now')
+                 WHERE COALESCE(cooldown_until_ts,0) > 0 AND cooldown_until_ts < ?
+                """,
+                (int(now_epoch),),
+            )
+            c.commit()
+            return cur.rowcount
+
+    def recent_orders(self, symbol: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._conn() as c:
+            cur = c.execute(
+                """
+                SELECT * FROM futures_orders
+                 WHERE symbol=?
+                 ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (symbol, int(limit)),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def open_positions_by_side(self) -> Dict[str, int]:
+        out = {"LONG": 0, "SHORT": 0}
+        for p in self.open_positions():
+            side = str(p.get("side") or "").upper()
+            if side in out:
+                out[side] += 1
+        return out
+
+    # ---- PnL tahmin/özet (hafif) --------------------------------------------
+    def record_close(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        qty: float,
+        pnl: float,
+    ) -> None:
         """
-        Kapanışları günlük PnL için kaydetmek üzere temel kayıt. Şu anlık sadece bellekte.
-        İstersen burayı veritabanına yazacak şekilde genişletebilirsin.
+        Günlük realized PnL için hafif bellek sayacı (istendiğinde DB'ye genişletilebilir).
         """
         if not hasattr(self, "_realized_pnl_today"):
             self._realized_pnl_today = 0.0
             self._realized_pnl_day = None
-        # gün değiştiyse sıfırla
         import datetime as _dt
         today = _dt.date.today()
         if self._realized_pnl_day != today:
@@ -485,7 +678,6 @@ class Persistence:
     def get_today_realized_pnl(self) -> float:
         if not hasattr(self, "_realized_pnl_today"):
             return 0.0
-        # gün kontrolü
         import datetime as _dt
         today = _dt.date.today()
         if getattr(self, "_realized_pnl_day", today) != today:
@@ -494,8 +686,7 @@ class Persistence:
 
     def estimate_unrealized_pnl(self, price_provider) -> float:
         """
-        Açık pozisyonlardan anlık (unrealized) PnL tahmini.
-        list_open_positions() -> [{symbol, side:'LONG'|'SHORT', qty, entry_price}, ...]
+        list_open_positions() → [{symbol, side, qty, entry_price}, ...] üzerinden anlık PnL tahmini.
         """
         try:
             positions = self.list_open_positions() or []
@@ -527,5 +718,3 @@ class Persistence:
         unrealized = self.estimate_unrealized_pnl(price_provider)
         start_eq = float(start_equity_fallback or 0.0)
         return start_eq + realized + unrealized
-
-        

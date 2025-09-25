@@ -114,14 +114,17 @@ class StopManager:
     def upsert_stop_loss(self, symbol: str, side_close: str, stop_price: float) -> Optional[Dict[str, Any]]:
         """
         Yeni SL hedefi verildiğinde:
-          - mevcut reduceOnly STOP* emri bulunur
-          - replace kriterleri (min_move_pct, debounce_sec) sağlanıyorsa: cancel + yeni STOP_MARKET
-          - yoksa yeni STOP_MARKET direkt gönderilir
+        1) mevcut reduceOnly STOP* emri bulunur
+        2) replace kriterleri (min_move_pct, debounce_sec) sağlanıyorsa: cancel + yeni STOP_MARKET
+        3) yoksa yeni STOP_MARKET direkt gönderilir
+        4) başarılı upsert sonrası SL seviyesi ve orderId cache'e yazılır
         """
+        # 0) trailing yapılandırması
         tr_cfg = (self.cfg.get("trailing") or {})
         min_move_pct = float(tr_cfg.get("min_move_pct", 0.05))   # %0.05 default
         debounce_sec = int(tr_cfg.get("debounce_sec", 15))       # 15s default
 
+        # 1) Giriş doğrulama
         side_close = side_close.upper()
         if side_close not in ("BUY", "SELL"):
             self.logger.error(f"[SL] invalid side_close: {side_close}")
@@ -131,7 +134,7 @@ class StopManager:
             self.logger.error(f"[SL] invalid stop_price for {symbol}: {stop_price}")
             return None
 
-        # 1) Mevcut STOP* var mı?
+        # 2) Mevcut SL emri var mı?
         existed = self._find_existing_stop(symbol, side_close)
         if existed:
             try:
@@ -141,18 +144,18 @@ class StopManager:
         else:
             old_sp = 0.0
 
-        # 2) Kapatma miktarı (reduceOnly için aktif pozisyon kadar)
+        # 3) Kapatılacak miktar (aktif pozisyon)
         qty = self._position_qty_for_close(symbol, side_close)
         if qty <= 0:
             self.logger.debug(f"[SL] no position to protect for {symbol}")
             return None
 
-        # 3) Replace mi, yeni mi?
+        # 4) Replace mi, yeni mi?
         do_replace = False
         if existed and old_sp > 0:
             do_replace = self._should_replace(symbol, float(stop_price), old_sp, min_move_pct, debounce_sec)
 
-        # 4) Replace akışı
+        # 5) Replace gerekiyorsa eski SL emrini iptal et
         if existed and do_replace:
             try:
                 oid = existed.get("orderId")
@@ -163,7 +166,7 @@ class StopManager:
             except Exception as e:
                 self.logger.warning(f"[SL] cancel failed for {symbol}: {e}")
 
-        # 5) Yeni SL emri (ya ilk defa ya da replace sonrası)
+        # 6) Yeni STOP_MARKET emrini gönder
         try:
             res = self.router.place_order(
                 symbol=symbol,
@@ -174,9 +177,34 @@ class StopManager:
                 reduce_only=True,
                 tag="SL"
             )
+
+            # 6.1) orderId bilgisini al
+            order_id = None
+            try:
+                order_id = str(res.get("orderId") or res.get("order_id") or "")
+            except Exception:
+                order_id = None
+
+            # 6.2) zaman damgası ve log
             self._last_upsert_ts[symbol] = time.time()
             self.logger.info(f"[SL] upsert {symbol} {side_close} stop={stop_price} qty={qty} replace={bool(existed and do_replace)}")
+
+            # 6.3) cache: SL seviyesi ve orderId
+            if hasattr(self.persistence, "cache_update_sl"):
+                try:
+                    self.persistence.cache_update_sl(symbol, float(stop_price))
+                except Exception:
+                    pass
+
+            if hasattr(self.persistence, "cache_update_sl_order_id") and order_id:
+                try:
+                    self.persistence.cache_update_sl_order_id(symbol, order_id)
+                except Exception:
+                    pass
+
             return res
         except Exception as e:
+            # 7) Emir gönderimi başarısızsa logla
             self.logger.error(f"[SL] upsert failed for {symbol}: {e}")
             return None
+
