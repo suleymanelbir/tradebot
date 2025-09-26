@@ -745,3 +745,217 @@ class Persistence:
                 c.commit()
         except Exception as e:
             self.logger.debug(f"notifications_log insert skipped: {e}")
+            
+    # --- Günlük zaman penceresi (UTC offset ile) ---
+    def _day_bounds(self, date_str: str, tz_offset_hours: int = 0) -> tuple[int, int]:
+        """
+        date_str: 'YYYY-MM-DD'
+        Dönen: (start_ts, end_ts) epoch saniye
+        """
+        from datetime import datetime, timedelta, timezone
+        y, m, d = map(int, date_str.split("-"))
+        tz = timezone(timedelta(hours=tz_offset_hours))
+        start = datetime(y, m, d, 0, 0, 0, tzinfo=tz)
+        end = start + timedelta(days=1)
+        return int(start.timestamp()), int(end.timestamp())
+
+    @staticmethod
+    def _max_drawdown(series):
+        """
+        series: iteratif kümülatif PnL (realized) değerleri listesi
+        Döner: max drawdown (pozitif sayı)
+        """
+        max_peak = float("-inf")
+        max_dd = 0.0
+        for v in series:
+            if v > max_peak:
+                max_peak = v
+            dd = max_peak - v
+            if dd > max_dd:
+                max_dd = dd
+        return max_dd
+
+    def compute_daily_pnl_summary(
+        self,
+        date_str: str,
+        *,
+        tz_offset_hours: int = 0,
+        include_unrealized: bool = True,
+        price_provider = None,  # async veya sync callable: price_provider(symbol)->float
+    ) -> dict:
+        """
+        futures_trades tablosundan güne ait realized PnL/fee/winrate vb. hesaplar.
+        Ek metrikler: avg_win, avg_loss, profit_factor, win/loss streak (max & current).
+        Unrealized için positions_cache + price_provider kullanır (opsiyonel, approx).
+        """
+        import math
+
+        start_ts, end_ts = self._day_bounds(date_str, tz_offset_hours=tz_offset_hours)
+
+        # --- Günlük trade’leri çek (zaman sıralı) ---
+        with self._conn() as c:
+            cur = c.execute(
+                "SELECT id, order_id, symbol, side, price, qty, fee, realized_pnl, ts "
+                "FROM futures_trades WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
+                (start_ts, end_ts)
+            )
+            rows = cur.fetchall()
+
+        # --- Toplamlar ve performans metrikleri ---
+        total_fee = 0.0
+        total_realized = 0.0
+        wins = 0
+        losses = 0
+        sum_win = 0.0          # sadece pozitif pnl toplamı
+        sum_loss = 0.0         # sadece negatif pnl toplamı (negatif sayı)
+        best = None            # (pnl, row_dict)
+        worst = None
+
+        # DD için kümülatif realized seri
+        eq = 0.0
+        equity_curve = []
+
+        # Streak hesapları
+        max_win_streak = 0
+        max_loss_streak = 0
+        cur_win_streak = 0
+        cur_loss_streak = 0
+
+        trades_count = 0
+        trades_list = []
+
+        for r in rows:
+            rid, oid, sym, side, px, qty, fee, pnl, ts = r
+            fee = float(fee or 0.0)
+            pnl = float(pnl or 0.0)
+
+            total_fee += fee
+            total_realized += pnl
+            trades_count += 1
+
+            # win/loss sayacı + streak
+            if pnl > 0:
+                wins += 1
+                sum_win += pnl
+                cur_win_streak += 1
+                cur_loss_streak = 0
+                if cur_win_streak > max_win_streak:
+                    max_win_streak = cur_win_streak
+            elif pnl < 0:
+                losses += 1
+                sum_loss += pnl  # negatif
+                cur_loss_streak += 1
+                cur_win_streak = 0
+                if cur_loss_streak > max_loss_streak:
+                    max_loss_streak = cur_loss_streak
+            else:
+                # pnl == 0 ise her iki streak'i de sıfırla
+                cur_win_streak = 0
+                cur_loss_streak = 0
+
+            # best/worst
+            if best is None or pnl > best[0]:
+                best = (pnl, {"order_id": oid, "symbol": sym, "pnl": pnl, "ts": ts})
+            if worst is None or pnl < worst[0]:
+                worst = (pnl, {"order_id": oid, "symbol": sym, "pnl": pnl, "ts": ts})
+
+            # realized-bazlı equity
+            eq += pnl
+            equity_curve.append(eq)
+
+            trades_list.append({
+                "order_id": oid, "symbol": sym, "side": side,
+                "price": float(px or 0.0), "qty": float(qty or 0.0),
+                "pnl": pnl, "fee": fee, "ts": int(ts or 0)
+            })
+
+        # Ortalama kazanç/kayıp
+        avg_win = (sum_win / wins) if wins > 0 else 0.0
+        # avg_loss'ı mutlak değerle (pozitif) ifade etmek daha anlaşılır
+        avg_loss = (abs(sum_loss) / losses) if losses > 0 else 0.0
+
+        # Profit Factor = (toplam kazanç) / (toplam kayıp mutlak)
+        profit_factor = None
+        if losses > 0 and abs(sum_loss) > 1e-12:
+            profit_factor = (sum_win / abs(sum_loss))
+        elif wins > 0 and losses == 0:
+            # hiç kayıp yoksa PF teorik olarak sonsuz; raporda "inf" gösterebiliriz
+            profit_factor = math.inf
+
+        realized_net = total_realized - total_fee
+        winrate = (wins / trades_count) if trades_count > 0 else 0.0
+        max_dd = self._max_drawdown(equity_curve) if equity_curve else 0.0
+
+        # current streak
+        if cur_win_streak > 0:
+            current_streak_type = "WIN"
+            current_streak_len = cur_win_streak
+        elif cur_loss_streak > 0:
+            current_streak_type = "LOSS"
+            current_streak_len = cur_loss_streak
+        else:
+            current_streak_type = "NONE"
+            current_streak_len = 0
+
+        # --- Unrealized (opsiyonel ve approx) ---
+        unrealized = 0.0
+        open_positions = []
+        if include_unrealized and callable(price_provider):
+            try:
+                open_positions = self.list_open_positions() or []
+                for p in open_positions:
+                    sym = p.get("symbol")
+                    side = str(p.get("side") or "").upper()
+                    qty = float(p.get("qty") or 0.0)
+                    entry = float(p.get("entry_price") or 0.0)
+                    if not sym or qty == 0 or entry == 0:
+                        continue
+                    try:
+                        last_px = price_provider(sym)
+                        # price_provider async ise burada beklemiyoruz; loops tarafında sync wrapper geçiyoruz
+                    except Exception:
+                        last_px = None
+                    if last_px is None:
+                        continue
+                    mark = float(last_px)
+                    side_sign = 1.0 if side == "LONG" else -1.0
+                    unrealized += side_sign * (mark - entry) * qty
+            except Exception:
+                pass
+
+        return {
+            "event": "pnl_daily",
+            "date": date_str,
+
+            # Core
+            "trades": trades_count,
+            "wins": wins,
+            "losses": losses,
+            "winrate": round(winrate, 4),
+
+            # PnL
+            "realized_pnl_gross": round(total_realized, 6),
+            "fees": round(total_fee, 6),
+            "realized_pnl": round(realized_net, 6),
+            "unrealized_pnl": round(unrealized, 6),
+
+            # Distributions
+            "avg_win": round(avg_win, 6),
+            "avg_loss": round(avg_loss, 6),                 # pozitif verilmiştir
+            "profit_factor": (round(profit_factor, 4) if isinstance(profit_factor, float) else str(profit_factor)),
+
+            # Streaks
+            "max_win_streak": max_win_streak,
+            "max_loss_streak": max_loss_streak,
+            "current_streak_type": current_streak_type,     # WIN | LOSS | NONE
+            "current_streak_len": current_streak_len,
+
+            # Risk
+            "max_dd": round(max_dd, 6),
+
+            # Examples/samples
+            "best_trade": (best[1] if best else None),
+            "worst_trade": (worst[1] if worst else None),
+            "trades_sample": trades_list[:10],
+            "open_positions": open_positions,
+        }

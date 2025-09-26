@@ -418,8 +418,13 @@ async def main() -> None:
 
     # 14.12 – Gün sonu PnL özeti (STOP tan sonra, TASKS içine!)
     tasks.append(asyncio.create_task(
-        daily_pnl_summary_loop(persistence, notifier, stop, tz_offset_hours=3, run_at="23:59"),
-        name="pnl_daily_summary",
+        daily_pnl_summary_loop(
+        persistence, notifier, stop,
+        tz_offset_hours=3, run_at="23:59",
+        price_provider=lambda s: stream.get_last_price(s),
+        include_unrealized=True,
+    ),
+    name="pnl_daily_summary",
     ))
 
     await notifier.info_trades({"event": "startup", "msg": "✅ All modules initialized. Bot is running."})

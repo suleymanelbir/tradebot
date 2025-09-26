@@ -219,12 +219,16 @@ async def daily_reset_loop(kill_switch, notifier, stop_event=None, tz_offset_hou
         except Exception as e:
             log.error(f"[KS-RESET] error: {e}")
 
-async def daily_pnl_summary_loop(persistence, notifier, stop_event: asyncio.Event, tz_offset_hours: int = 3, run_at="23:59"):
-    """
-    Her gün yerel TZ'ye göre 'run_at' saatinde PnL özetini gönderir ve DB'ye yazar.
-    PnL hesaplaması sizin 'trades/closed_trades' yapınıza göre burada ya da persistence içinde yapılabilir.
-    Şimdilik sadece iskelet: payload'u oluşturup gönderiyoruz.
-    """
+async def daily_pnl_summary_loop(
+    persistence,
+    notifier,
+    stop_event: asyncio.Event,
+    *,
+    tz_offset_hours: int = 3,
+    run_at: str = "23:59",
+    price_provider = None,          # async/sync: price_provider(symbol)
+    include_unrealized: bool = True # açık pozisyonları rapora ekle
+):
     logger = logging.getLogger("pnl_daily")
     hh, mm = map(int, run_at.split(":"))
     tz = timezone(timedelta(hours=tz_offset_hours))
@@ -241,33 +245,28 @@ async def daily_pnl_summary_loop(persistence, notifier, stop_event: asyncio.Even
         if stop_event and stop_event.is_set():
             break
         try:
-            # --- PnL hesapla (yerinize göre uyarlayın) ---
-            # ör: payload = persistence.compute_daily_pnl_summary(date=today_str)
-            payload = {
-                "event": "pnl_daily",
-                "date": datetime.now(tz).strftime("%Y-%m-%d"),
-                "realized_pnl": 0.0,
-                "unrealized_pnl": 0.0,
-                "winrate": 0.0,
-                "max_dd": 0.0,
-                "trades": 0,
-                "best_trade": None,
-                "worst_trade": None,
-            }
-            # Telegram
-            await notifier.info_trades(payload)
-            logger.info(f"[PNL] daily summary sent: {payload}")
+            date_str = datetime.now(tz).strftime("%Y-%m-%d")
 
-            # DB ayna (Notifier zaten aynalıyor ama garanti olsun istersen doğrudan da yazabilirsin)
-            try:
-                if hasattr(persistence, "log_notification"):
-                    persistence.log_notification(channel="trades_bot", topic="pnl_daily", level="INFO", payload=payload)
-            except Exception:
-                pass
+            # Unrealized PnL’i persistence içinde hesaplamak zor → price_provider async/sync olabilir
+            # Bu yüzden burada basit bir sarmalayıcı yapıyoruz:
+            def _pp(sym: str):
+                res = price_provider(sym) if callable(price_provider) else None
+                return res
+
+            summary = persistence.compute_daily_pnl_summary(
+                date_str,
+                tz_offset_hours=tz_offset_hours,
+                include_unrealized=include_unrealized,
+                price_provider=_pp,
+            )
+
+            # Telegram (ve Notifier mirror ile DB)
+            await notifier.notify_pnl_daily(summary)
+            logger.info(f"[PNL] daily summary sent: {summary}")
 
         except Exception as e:
             logger.error(f"daily pnl loop error: {e}")
-
+            
 async def position_risk_guard_loop(
     client,
     notifier,

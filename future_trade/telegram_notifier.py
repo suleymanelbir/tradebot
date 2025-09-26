@@ -138,20 +138,32 @@ class Notifier:
     # 4) Hazır yardımcılar (konulu bildirimler)
     async def notify_pnl_daily(self, summary: Dict[str, Any]) -> None:
         """
-        Gün sonu PnL özeti.
-        summary örn: {"event":"pnl_daily","date":"2025-09-26","realized_pnl":..., ...}
+        Gün sonu PnL özeti (genişletilmiş).
         """
         topic = str(summary.get("event") or "pnl_daily")
         self._mirror_to_db(channel="trades_bot", topic=topic, level="INFO", payload=summary)
-        text = (
-            f"📊 Gün Sonu PnL — {summary.get('date')}\n"
-            f"- Realized: {summary.get('realized_pnl')}\n"
-            f"- Unrealized: {summary.get('unrealized_pnl')}\n"
-            f"- Winrate: {summary.get('winrate')}\n"
-            f"- Max DD: {summary.get('max_dd')}\n"
-            f"- Trades: {summary.get('trades')}\n"
-        )
+
+        # Güvenli alımlar
+        def _fmt(x, nd=4):
+            try:
+                return f"{float(x):.{nd}f}"
+            except Exception:
+                return str(x)
+
+        lines = [
+            f"📊 Gün Sonu PnL — {summary.get('date')}",
+            f"🔢 Trades: {summary.get('trades',0)}  |  Wins: {summary.get('wins',0)}  Losses: {summary.get('losses',0)}  Winrate: {_fmt(100*summary.get('winrate',0),2)}%",
+            f"💰 Realized(Net): {_fmt(summary.get('realized_pnl'),4)}   (Gross: {_fmt(summary.get('realized_pnl_gross'),4)}  Fees: {_fmt(summary.get('fees'),4)})",
+            f"📈 Unrealized: {_fmt(summary.get('unrealized_pnl'),4)}",
+            f"🏆 Avg Win: {_fmt(summary.get('avg_win'),4)}   |   💥 Avg Loss: {_fmt(summary.get('avg_loss'),4)}",
+            f"📐 Profit Factor: {summary.get('profit_factor')}",
+            f"📉 Max DD (realized curve): {_fmt(summary.get('max_dd'),4)}",
+            f"⏱️ Streak — Max WIN: {summary.get('max_win_streak',0)}  |  Max LOSS: {summary.get('max_loss_streak',0)}  |  Current: {summary.get('current_streak_type','NONE')} x{summary.get('current_streak_len',0)}",
+        ]
+
+        text = "\n".join(lines)
         await self._send(self._trades, text)
+
 
     async def notify_position_risk(self, payload: Dict[str, Any]) -> None:
         """
