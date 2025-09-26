@@ -37,6 +37,7 @@ from future_trade.protective_sweeper import ProtectiveSweeper
 from future_trade.oco_watcher import OCOWatcher
 from future_trade.klines_cache import KlinesCache
 from future_trade.loops import position_risk_guard_loop
+from future_trade.loops import performance_guard_loop
 # =========================
 # 4) Strateji Sistemi
 # =========================
@@ -447,6 +448,25 @@ async def main() -> None:
             ),
             name="position_risk_guard",
         ))
+        
+        # 14.14 Performance Guard (intra-day PF & loss streak)
+    pg = cfg.get("performance_guard", {}) or {}
+    if pg.get("enabled", True):
+        tasks.append(asyncio.create_task(
+            performance_guard_loop(
+                persistence=persistence,
+                notifier=notifier,
+                stop_event=stop,
+                interval_sec=int(pg.get("interval_sec", 120)),
+                profit_factor_floor=float(pg.get("profit_factor_floor", 1.0)),
+                loss_streak_threshold=int(pg.get("loss_streak_threshold", 3)),
+                min_trades=int(pg.get("min_trades", 5)),
+                cooldown_sec=int(pg.get("cooldown_sec", 900)),
+                tz_offset_hours=int(pg.get("tz_offset_hours", 3)),
+            ),
+            name="performance_guard",
+        ))
+
 
     # =======================
     # 15) ÇALIŞTIR & KAPAT

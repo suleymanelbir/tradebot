@@ -330,3 +330,102 @@ async def position_risk_guard_loop(
         except Exception as e:
             log.error(f"pos risk loop err: {e}")
         await asyncio.sleep(max(20, interval_sec))
+
+# Gün içi günlük Pnl özeti
+
+
+async def performance_guard_loop(
+    persistence,
+    notifier,
+    stop_event: asyncio.Event,
+    *,
+    interval_sec: int = 120,
+    profit_factor_floor: float = 1.0,
+    loss_streak_threshold: int = 3,
+    min_trades: int = 5,
+    cooldown_sec: int = 900,
+    tz_offset_hours: int = 3,
+):
+    """
+    Gün içinde belirli aralıklarla günlük PnL özetini (o ana kadar) hesaplar,
+    aşağıdaki koşullarda erken uyarı gönderir:
+      - profit_factor < floor
+      - current loss streak >= threshold
+    Uyarı tipi başına cooldown uygulanır.
+    """
+    log = logging.getLogger("perf_guard")
+    last_alert_ts = {"PF_BELOW_FLOOR": 0, "LOSS_STREAK": 0}
+
+    def _now_ts():
+        import time
+        return int(time.time())
+
+    def _today_str():
+        tz = timezone(timedelta(hours=tz_offset_hours))
+        return datetime.now(tz).strftime("%Y-%m-%d")
+
+    while not (stop_event and stop_event.is_set()):
+        try:
+            date_str = _today_str()
+
+            # Gün içi o ana kadar olan özet (unrealized gereksiz → False)
+            summary = persistence.compute_daily_pnl_summary(
+                date_str,
+                tz_offset_hours=tz_offset_hours,
+                include_unrealized=False,
+                price_provider=None,
+            )
+            trades = int(summary.get("trades") or 0)
+            if trades >= min_trades:
+                # PF sayıya çevrilir (inf/string olabilir)
+                pf_raw = summary.get("profit_factor")
+                try:
+                    pf = float(pf_raw)
+                except Exception:
+                    pf = float("inf") if str(pf_raw).lower() == "inf" else None
+
+                # 1) Profit Factor zeminin altı
+                if pf is not None and pf < float(profit_factor_floor):
+                    now = _now_ts()
+                    if now - last_alert_ts["PF_BELOW_FLOOR"] >= int(cooldown_sec):
+                        payload = {
+                            "event": "perf_guard",
+                            "date": date_str,
+                            "trades": trades,
+                            "winrate": summary.get("winrate", 0.0),
+                            "profit_factor": pf,
+                            "floor": profit_factor_floor,
+                            "loss_streak": summary.get("current_streak_len", 0)
+                                if summary.get("current_streak_type") == "LOSS" else 0,
+                            "threshold": loss_streak_threshold,
+                            "reason": "PF_BELOW_FLOOR",
+                        }
+                        await notifier.notify_performance_alert(payload)
+                        last_alert_ts["PF_BELOW_FLOOR"] = now
+                        log.warning(f"[PERF] PF below floor: pf={pf} floor={profit_factor_floor}")
+
+                # 2) Loss streak eşiği
+                if str(summary.get("current_streak_type")).upper() == "LOSS":
+                    ls = int(summary.get("current_streak_len") or 0)
+                    if ls >= int(loss_streak_threshold):
+                        now = _now_ts()
+                        if now - last_alert_ts["LOSS_STREAK"] >= int(cooldown_sec):
+                            payload = {
+                                "event": "perf_guard",
+                                "date": date_str,
+                                "trades": trades,
+                                "winrate": summary.get("winrate", 0.0),
+                                "profit_factor": summary.get("profit_factor"),
+                                "floor": profit_factor_floor,
+                                "loss_streak": ls,
+                                "threshold": loss_streak_threshold,
+                                "reason": "LOSS_STREAK",
+                            }
+                            await notifier.notify_performance_alert(payload)
+                            last_alert_ts["LOSS_STREAK"] = now
+                            log.warning(f"[PERF] Loss streak >= threshold: ls={ls} thr={loss_streak_threshold}")
+
+        except Exception as e:
+            log.error(f"performance guard loop error: {e}")
+
+        await asyncio.sleep(max(30, int(interval_sec)))

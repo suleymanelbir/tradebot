@@ -235,3 +235,44 @@ class Notifier:
             except Exception:
                 pass
             self._session = None
+
+# Bu helper alerts_bot üzerinden uyarı atar ve notifications_log’a aynalar.
+    async def notify_performance_alert(self, payload: Dict[str, Any]) -> None:
+        """
+        Intra-day performans uyarıları (PF < floor, loss streak >= threshold).
+        payload örn:
+        {
+            "event":"perf_guard",
+            "date":"2025-09-27",
+            "trades":12,
+            "profit_factor":0.86,
+            "loss_streak":4,
+            "winrate":0.33,
+            "reason":"PF_BELOW_FLOOR" | "LOSS_STREAK",
+            "floor":1.0,
+            "threshold":3
+        }
+        """
+        topic = str(payload.get("event") or "perf_guard")
+        # DB aynası (alerts kanalına WARN)
+        self._mirror_to_db(channel="alerts_bot", topic=topic, level="WARN", payload=payload)
+
+        def _fmt(x, nd=4):
+            try:
+                return f"{float(x):.{nd}f}"
+            except Exception:
+                return str(x)
+
+        lines = [
+            f"🟠 Performans Uyarısı — {payload.get('date')}",
+            f"🔢 Trades: {payload.get('trades')}, Winrate: { _fmt(100*float(payload.get('winrate',0)),2) }%",
+        ]
+        pf = payload.get("profit_factor")
+        if pf is not None:
+            lines.append(f"📐 Profit Factor: {pf}  (zemin: {payload.get('floor')})")
+        if payload.get("loss_streak") is not None:
+            lines.append(f"⛓️ Loss Streak: {payload.get('loss_streak')}  (eşik: {payload.get('threshold')})")
+        lines.append(f"🧭 Neden: {payload.get('reason')}")
+        text = "\n".join(lines)
+
+        await self._send(self._alerts, text)
