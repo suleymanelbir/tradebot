@@ -5,7 +5,7 @@ Binance USDT-M Futures HTTP/WS istemcisi
 - paper: ağ KAPALI (stub/dummy yanıtlar); botu hızlıca ayağa kaldırmak içindir
 """
 import time, hmac, hashlib, logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 import httpx
 from urllib.parse import urlencode
 import asyncio
@@ -136,7 +136,7 @@ class BinanceClient:
             # “network disabled” ise sentetik dön
             # self._network_disabled gibi bir bayrak kullanıyorsan:
             if getattr(self, "_paper_network_disabled", False):
-                from pathlib import Path
+                
                 # whitelist’i config’ten app içinde biliyoruz; burada bilmiyorsak generic örnek:
                 syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
                 return {"symbols": [_paper_filters_for(s) for s in syms]}
@@ -150,10 +150,53 @@ class BinanceClient:
 
 
     # -------------------- private/signed uçlar (stub destekli) --------------------
-    async def get_account(self) -> dict:
-        if self.paper:
-            return {"availableBalance": "10000"}
-        return await self._signed("GET", "/fapi/v2/account", {})
+    async def get_account(self) -> Dict[str, Any]:
+        """
+        /fapi/v2/account – serbest bakiye ve marj bilgileri
+        PAPER modda stub veri döner, gerçek modda imzalı GET çağrısı yapılır.
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            # PAPER: basit stub
+            return {
+                "totalWalletBalance": "1000",
+                "availableBalance": "1000"
+            }
+
+        get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None)
+        if not callable(get):
+            raise RuntimeError("signed GET helper not found")
+
+        return await get("/fapi/v2/account", params={})
+    
+    
+    async def get_position_risk(self, symbol: str = None):
+        """
+        /fapi/v2/positionRisk – pozisyonların risk metrikleri
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            return []
+        get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None)
+        if not callable(get):
+            raise RuntimeError("signed GET helper not found")
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        return await get("/fapi/v2/positionRisk", params=params)
+
+
+    async def get_leverage_brackets(self, symbol: str):
+        """
+        /fapi/v1/leverageBracket – bakım marjı basamakları
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            # PAPER: tek basamak varsayalım
+            return [{"symbol": symbol, "brackets": [{"bracket": 1, "initialLeverage": 20, "maintMarginRatio": 0.004}]}]
+        get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None)
+        if not callable(get):
+            raise RuntimeError("signed GET helper not found")
+        res = await get("/fapi/v1/leverageBracket", params={"symbol": symbol})
+        # Binance bazen liste içinde döner
+        return res
 
     async def get_available_usdt(self) -> float:
         acc = await self.get_account()

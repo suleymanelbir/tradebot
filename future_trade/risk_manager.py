@@ -241,3 +241,131 @@ class RiskManager:
             reduce_only_protection=bool(order_cfg.get("reduce_only_protection", True)),
         )
         return plan
+
+
+        # ------------- Margin Guard Helpers -----------------
+    def bind_client(self, client):
+        self._client = client
+
+    def bind_margin_cfg(self, mg_cfg: dict | None):
+        self._mg = mg_cfg or {}
+        self._mg.setdefault("enabled", True)
+        self._mg.setdefault("reserve_pct", 0.10)
+        self._mg.setdefault("min_free_usdt", 15.0)
+        self._mg.setdefault("fee_rate", 0.0005)
+        self._mg.setdefault("slippage_pct", 0.001)
+        self._mg.setdefault("mm_buffer_pct", 0.05)
+        self._mg.setdefault("allow_reduce_only_override", True)
+
+    def _notional(self, price: float, qty: float) -> float:
+        return max(0.0, float(price) * float(qty))
+
+    def _est_fees(self, notional: float) -> float:
+        fee = float(self._mg.get("fee_rate", 0.0005))
+        return notional * fee
+
+    async def _maint_margin_ratio(self, symbol: str, notional: float, lev: int) -> float:
+        """
+        Leverage bracket'tan approx MMR bul. Basit yaklaşım: ilk bracket'ın oranını kullan,
+        ya da notional'a en yakın bracket'ı seç.
+        """
+        client = getattr(self, "_client", None)
+        if not client:
+            return 0.004  # güvenli varsayım (~0.4%)
+        try:
+            data = await client.get_leverage_brackets(symbol)
+            # response bazen list of obj olabilir
+            if isinstance(data, list) and data and "brackets" in data[0]:
+                brackets = data[0]["brackets"]
+            elif isinstance(data, dict) and "brackets" in data:
+                brackets = data["brackets"]
+            else:
+                return 0.004
+            # en basit seçim: ilk bracket
+            mmr = float(brackets[0].get("maintMarginRatio", 0.004))
+            return max(0.0, mmr)
+        except Exception:
+            return 0.004
+
+    async def suggest_affordable_qty(
+        self,
+        symbol: str,
+        side: str,
+        desired_qty: float,
+        price: float,
+        leverage: int,
+        reduce_only: bool = False,
+    ) -> tuple[float, str]:
+        """
+        Emir öncesi teminat kontrolü:
+          - availableBalance, reserve_pct, min_free_usdt
+          - initial margin ≈ notional/leverage
+          - maint margin ≈ notional * mmr
+          - fees + slippage + buffer
+        Döner: (uygun_qty, reason)
+        """
+        # ReduceOnly emirler opsiyonel muaf
+        if reduce_only and self._mg.get("allow_reduce_only_override", True):
+            return float(desired_qty), "reduce_only_override"
+
+        client = getattr(self, "_client", None)
+        if not client:
+            return float(desired_qty), "no_client"
+
+        # Hesap bakiyesi
+        try:
+            acct = await client.get_account()
+            avail = float(acct.get("availableBalance") or acct.get("totalWalletBalance") or 0.0)
+        except Exception:
+            avail = 0.0
+
+        reserve = avail * float(self._mg.get("reserve_pct", 0.10))
+        min_free = float(self._mg.get("min_free_usdt", 15.0))
+        fee_rate = float(self._mg.get("fee_rate", 0.0005)) # ileride işlem maliyeti hesaplamasında kullanılacak
+        slip = float(self._mg.get("slippage_pct", 0.001))
+        mm_buf = float(self._mg.get("mm_buffer_pct", 0.05))
+
+        # fiyatı kötüleştir
+        px = float(price) * (1.0 + slip if side.upper() == "BUY" else 1.0 - slip)
+        lev = max(1, int(leverage))
+
+        # İhtiyaç hesabı için binary search ile qty kırpma
+        lo, hi = 0.0, float(desired_qty)
+        ok_qty = 0.0
+        reason = "ok"   # ileride guard karar gerekçesi olarak kullanılacak
+        self.logger.debug(f"[MG] fee_rate={fee_rate}, initial_reason={reason}") # ileride kullanılacak Pyflakes uyarından kaçınmak için eklendi 
+        # MMR tahmin (notional'a göre değişebilir; ilk iterasyonda desired)
+        mmr = await self._maint_margin_ratio(symbol, self._notional(px, hi), lev)
+
+        def need_margin(qty: float) -> float:
+            notional = self._notional(px, qty)
+            im = notional / lev                          # initial margin
+            mm = notional * mmr * (1.0 + mm_buf)         # maint margin + buffer
+            fees = self._est_fees(notional)
+            return im + mm + fees
+
+        # toplam kullanılabilir: avail - reserve, ayrıca min_free koşulu
+        budget = max(0.0, avail - reserve)
+        if budget < min_free:
+            return 0.0, f"insufficient_free_balance: free<{min_free}usdt"
+
+        # Eğer desired zaten sığıyorsa direkt geç
+        if need_margin(hi) <= budget:
+            return hi, "within_budget"
+
+        # Binary search ile en yüksek uygun qty
+        for _ in range(24):
+            mid = (lo + hi) / 2.0
+            if mid <= 0:
+                break
+            req = need_margin(mid)
+            if req <= budget:
+                ok_qty = mid
+                lo = mid
+            else:
+                hi = mid
+
+        if ok_qty <= 0:
+            return 0.0, "no_affordable_qty"
+
+        return ok_qty, "shrunk_to_fit"

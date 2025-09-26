@@ -47,13 +47,13 @@ class OrderManager:
         return self.stream.get_last_price(symbol) if hasattr(self.stream, "get_last_price") else None
 
     # ---- asıl iş ----
-    def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+    async def open_entry_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
         """
         intent örneği:
         { "action":"entry", "symbol":"SOLUSDT", "side":"BUY"|"SELL",
-            "qty": optional float, "risk_pct": optional float,
-            "order_type": "MARKET"|"LIMIT"|"STOP_MARKET",
-            "price": optional float }
+        "qty": optional float, "risk_pct": optional float,
+        "order_type": "MARKET"|"LIMIT"|"STOP_MARKET",
+        "price": optional float }
         """
 
         # 1) Kill-Switch kontrolü
@@ -122,7 +122,37 @@ class OrderManager:
             price = n["price"] if price is not None else None
             qty = n["qty"]
 
-        # 6) Emir gönderimi
+        # 6) Margin Guard kontrolü (emir atmadan hemen önce)
+        if hasattr(self.risk_manager, "suggest_affordable_qty"):
+            try:
+                ok_qty, guard_reason = await self.risk_manager.suggest_affordable_qty(
+                    symbol=symbol,
+                    side=side,
+                    desired_qty=qty,
+                    price=price,
+                    leverage=self.risk.leverage_for(symbol),
+                    reduce_only=False
+                )
+                if ok_qty <= 0:
+                    # tamamen engelle
+                    self.logger.warning(f"[MG] blocked {symbol} {side} qty={qty} reason={guard_reason}")
+                    if self.notifier:
+                        await self.notifier.alert({
+                            "event": "margin_guard_block",
+                            "symbol": symbol,
+                            "side": side,
+                            "qty": qty,
+                            "reason": guard_reason
+                        })
+                    return None
+                if ok_qty < qty:
+                    self.logger.info(f"[MG] shrink {symbol} {side} {qty}→{ok_qty} ({guard_reason})")
+                    qty = ok_qty
+            except Exception as e:
+                self.logger.warning(f"[MG] guard failed (soft-allow): {e}")
+                # guard çökerse emri engellemeyelim; loglamak yeterli
+
+        # 7) Emir gönderimi
         res = self.router.place_order(
             symbol=symbol,
             side=side,
@@ -133,16 +163,16 @@ class OrderManager:
             tag="entry"
         )
 
-        # 7) ENTRY sonrası pozisyonu cache'e yaz
+        # 8) ENTRY sonrası pozisyonu cache'e yaz
         pos_side = "LONG" if side == "BUY" else "SHORT"
         fill_price = res.get("avgPrice") or res.get("price") or self._last_price(symbol) or price or 0.0
         if hasattr(self.persistence, "cache_add_open_position"):
             self.persistence.cache_add_open_position(symbol, pos_side, qty, float(fill_price))
 
-        # 8) ENTRY log kaydı
+        # 9) ENTRY log kaydı
         self.logger.info(f"[ENTRY] {symbol} {pos_side} qty={qty} entry={fill_price}")
 
-        # 9) KISMİ KAPANIŞ kontrolü (örnek: pozisyon zaten vardı ve miktar azaldıysa)
+        # 10) KISMİ KAPANIŞ kontrolü
         if hasattr(self.persistence, "cache_update_position"):
             try:
                 old_qty = self._get_cached_qty(symbol)
@@ -153,7 +183,7 @@ class OrderManager:
             except Exception:
                 pass
 
-        # 10) TAM KAPANIŞ kontrolü (örnek: pozisyon sıfırlandıysa)
+        # 11) TAM KAPANIŞ kontrolü
         if hasattr(self.persistence, "cache_close_position"):
             try:
                 if qty <= 0:
