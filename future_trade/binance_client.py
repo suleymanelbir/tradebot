@@ -294,7 +294,6 @@ class BinanceClient:
             raise RuntimeError("Event loop zaten çalışıyor. Router'ı async bağlamda çağır ya da sync wrapper'ı dışarıdan kullanma.")
         return loop.run_until_complete(async_impl(**kwargs))
 
-    
 
     async def open_orders(self, symbol: str):
         if self.paper:
@@ -405,3 +404,95 @@ class BinanceClient:
             return await signed_get("/fapi/v1/openOrders", params=params)
         # Yoksa _get zaten imzalı sürümü kapsıyorsa onu kullanın
         return await get("/fapi/v1/openOrders", params=params)
+
+    # --- User-Data Stream (listenKey) ---  (FUTURES)
+    async def create_listen_key(self):
+        """
+        POST /fapi/v1/listenKey → {"listenKey": "..."}  (API-KEY header, signature GEREKMEZ)
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            return {"listenKey": "paper_listen_key"}
+        return await self._api_key_post("/fapi/v1/listenKey", data={})
+
+    async def keepalive_listen_key(self, listen_key: str):
+        """
+        PUT /fapi/v1/listenKey (API-KEY header) — 30~60 dk'da bir yenile
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            return {"code": 200, "msg": "paper keepalive ok"}
+        return await self._api_key_put("/fapi/v1/listenKey", data={"listenKey": listen_key})
+
+    async def close_listen_key(self, listen_key: str):
+        """
+        DELETE /fapi/v1/listenKey (API-KEY header)
+        """
+        if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
+            return {"code": 200, "msg": "paper close ok"}
+        return await self._api_key_delete("/fapi/v1/listenKey", data={"listenKey": listen_key})
+
+
+    # ---- API-KEY (unsigned) helpers for listenKey ----
+    async def _api_key_post(self, path: str, data: dict | None = None):
+        import aiohttp, asyncio
+        base = getattr(self, "base_url", "https://fapi.binance.com")
+        api_key = getattr(self, "api_key", None) or getattr(self, "key", None)
+        url = f"{base}{path}"
+        headers = {"X-MBX-APIKEY": api_key} if api_key else {}
+        # varsa mevcut helper'ları dene
+        for name in ("_post", "http_post"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                res = fn(path, data=data or {}, headers=headers)
+                return await res if asyncio.iscoroutine(res) else res
+        # yoksa doğrudan aiohttp ile çağır
+        sess = getattr(self, "_session", None)
+        if sess is None:
+            self._session = aiohttp.ClientSession()
+            sess = self._session
+        async with sess.post(url, data=data or {}, headers=headers, timeout=15) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def _api_key_put(self, path: str, data: dict | None = None):
+        import aiohttp, asyncio
+        base = getattr(self, "base_url", "https://fapi.binance.com")
+        api_key = getattr(self, "api_key", None) or getattr(self, "key", None)
+        url = f"{base}{path}"
+        headers = {"X-MBX-APIKEY": api_key} if api_key else {}
+        for name in ("_put", "http_put"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                res = fn(path, data=data or {}, headers=headers)
+                return await res if asyncio.iscoroutine(res) else res
+        sess = getattr(self, "_session", None)
+        if sess is None:
+            import aiohttp as _aiohttp
+            self._session = _aiohttp.ClientSession()
+            sess = self._session
+        async with sess.put(url, data=data or {}, headers=headers, timeout=15) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def _api_key_delete(self, path: str, data: dict | None = None):
+        import aiohttp, asyncio
+        base = getattr(self, "base_url", "https://fapi.binance.com")
+        api_key = getattr(self, "api_key", None) or getattr(self, "key", None)
+        url = f"{base}{path}"
+        headers = {"X-MBX-APIKEY": api_key} if api_key else {}
+        for name in ("_delete", "http_delete"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                res = fn(path, data=data or {}, headers=headers)
+                return await res if asyncio.iscoroutine(res) else res
+        sess = getattr(self, "_session", None)
+        if sess is None:
+            import aiohttp as _aiohttp
+            self._session = _aiohttp.ClientSession()
+            sess = self._session
+        async with sess.delete(url, data=data or {}, headers=headers, timeout=15) as r:
+            r.raise_for_status()
+            # DELETE bazen body dönmez; uyum için boş dict döndür
+            try:
+                return await r.json()
+            except Exception:
+                return {}
