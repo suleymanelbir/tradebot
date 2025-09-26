@@ -1,8 +1,10 @@
 # /opt/tradebot/future_trade/loops.py
 import asyncio
-import logging
-from typing import Any, Dict
 import inspect
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict
+
 from future_trade.strategy.base import Signal
 
 
@@ -216,3 +218,116 @@ async def daily_reset_loop(kill_switch, notifier, stop_event=None, tz_offset_hou
             log.info("[KS-RESET] new day reset complete")
         except Exception as e:
             log.error(f"[KS-RESET] error: {e}")
+
+async def daily_pnl_summary_loop(persistence, notifier, stop_event: asyncio.Event, tz_offset_hours: int = 3, run_at="23:59"):
+    """
+    Her gün yerel TZ'ye göre 'run_at' saatinde PnL özetini gönderir ve DB'ye yazar.
+    PnL hesaplaması sizin 'trades/closed_trades' yapınıza göre burada ya da persistence içinde yapılabilir.
+    Şimdilik sadece iskelet: payload'u oluşturup gönderiyoruz.
+    """
+    logger = logging.getLogger("pnl_daily")
+    hh, mm = map(int, run_at.split(":"))
+    tz = timezone(timedelta(hours=tz_offset_hours))
+
+    def _next_run() -> float:
+        now = datetime.now(tz)
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        return (target - now).total_seconds()
+
+    while not (stop_event and stop_event.is_set()):
+        await asyncio.sleep(_next_run())
+        if stop_event and stop_event.is_set():
+            break
+        try:
+            # --- PnL hesapla (yerinize göre uyarlayın) ---
+            # ör: payload = persistence.compute_daily_pnl_summary(date=today_str)
+            payload = {
+                "event": "pnl_daily",
+                "date": datetime.now(tz).strftime("%Y-%m-%d"),
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "winrate": 0.0,
+                "max_dd": 0.0,
+                "trades": 0,
+                "best_trade": None,
+                "worst_trade": None,
+            }
+            # Telegram
+            await notifier.info_trades(payload)
+            logger.info(f"[PNL] daily summary sent: {payload}")
+
+            # DB ayna (Notifier zaten aynalıyor ama garanti olsun istersen doğrudan da yazabilirsin)
+            try:
+                if hasattr(persistence, "log_notification"):
+                    persistence.log_notification(channel="trades_bot", topic="pnl_daily", level="INFO", payload=payload)
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"daily pnl loop error: {e}")
+
+async def position_risk_guard_loop(
+    client,
+    notifier,
+    persistence,
+    symbols: list[str],
+    stop_event: asyncio.Event,
+    interval_sec: int = 60,
+    warn_pct: float = 3.0,
+    crit_pct: float = 1.5,
+):
+    """
+    Her interval'da semboller için /fapi/v2/positionRisk kontrol eder.
+    Likidasyon mesafesi (|mark-liq|/mark) eşiğin altına inerse Telegram + DB log.
+    """
+    log = logging.getLogger("pos_risk_guard")
+    warn = warn_pct / 100.0
+    crit = crit_pct / 100.0
+
+    async def _check_symbol(sym: str):
+        try:
+            data = await client.get_position_risk(symbol=sym)
+        except Exception as e:
+            log.debug(f"fetch risk err {sym}: {e}")
+            return
+
+        for r in data or []:
+            try:
+                qty = float(r.get("positionAmt") or 0)
+                if abs(qty) <= 0:
+                    continue  # pozisyon yok
+                liq = float(r.get("liquidationPrice") or 0)
+                mark = float(r.get("markPrice") or 0)
+                if liq <= 0 or mark <= 0:
+                    continue
+                dist = abs(mark - liq) / mark
+                payload = {
+                    "event": "position_risk",
+                    "symbol": sym,
+                    "qty": qty,
+                    "mark": mark,
+                    "liq": liq,
+                    "dist_pct": dist,
+                }
+                if dist <= crit:
+                    await notifier.notify_position_risk(payload | {"level": "CRITICAL"})
+                    # DB aynası notifier içinde
+                    log.warning(f"[PRG] CRIT {sym} dist={dist:.2%}")
+                elif dist <= warn:
+                    await notifier.notify_position_risk(payload | {"level": "WARN"})
+                    log.info(f"[PRG] WARN {sym} dist={dist:.2%}")
+            except Exception as ie:
+                log.debug(f"parse risk err {sym}: {ie}")
+
+    while not (stop_event and stop_event.is_set()):
+        try:
+            if not symbols:
+                # boş ise sessizce geç
+                await asyncio.sleep(max(20, interval_sec))
+                continue
+            await asyncio.gather(*[_check_symbol(s) for s in symbols])
+        except Exception as e:
+            log.error(f"pos risk loop err: {e}")
+        await asyncio.sleep(max(20, interval_sec))

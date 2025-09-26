@@ -199,7 +199,21 @@ class Persistence:
             except Exception as e:
                 self.logger.debug(f"positions_cache add columns skipped: {e}")
 
-            # 5) Commit işlemi
+            # 5) notifications_log: Telegram vb. bildirimlerin kalıcı kaydı
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS notifications_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                channel TEXT,         -- 'alerts_bot' | 'trades_bot' | 'system' ...
+                topic TEXT,           -- 'pnl_daily', 'position_risk', 'kill_switch', ...
+                level TEXT,           -- 'INFO', 'WARN', 'ERROR'
+                payload TEXT          -- JSON metni (gönderilen mesaj/saha verileri)
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_notif_ts ON notifications_log(ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_notif_topic ON notifications_log(topic)")
+
+            # 6) Commit işlemi
             c.commit()
 
     # --------------------------- Helpers -------------------------------------
@@ -485,17 +499,17 @@ class Persistence:
                 )
         return out
 
-        def cache_update_sl_order_id(self, symbol: str, order_id: str | None) -> None:
-            with self._conn() as c:
-                c.execute("UPDATE positions_cache SET sl_order_id=?, updated_at=? WHERE symbol=?",
-                        (order_id, self._utc(), symbol))
-                c.commit()
+    def cache_update_sl_order_id(self, symbol: str, order_id: str | None) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE positions_cache SET sl_order_id=?, updated_at=? WHERE symbol=?",
+                    (order_id, self._utc(), symbol))
+            c.commit()
 
-        def cache_update_tp_order_id(self, symbol: str, order_id: str | None) -> None:
-            with self._conn() as c:
-                c.execute("UPDATE positions_cache SET tp_order_id=?, updated_at=? WHERE symbol=?",
-                        (order_id, self._utc(), symbol))
-                c.commit()
+    def cache_update_tp_order_id(self, symbol: str, order_id: str | None) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE positions_cache SET tp_order_id=?, updated_at=? WHERE symbol=?",
+                    (order_id, self._utc(), symbol))
+            c.commit()
 
     # ---- (opsiyonel) yalnız RAM içi mini güncelleme: adı net olsun
     def cache_update_position_mem(self, symbol: str, qty: float | None = None, entry_price: float | None = None, **extras) -> None:
@@ -718,3 +732,16 @@ class Persistence:
         unrealized = self.estimate_unrealized_pnl(price_provider)
         start_eq = float(start_equity_fallback or 0.0)
         return start_eq + realized + unrealized
+
+    def log_notification(self, channel: str, topic: str, level: str, payload: dict | str) -> None:
+        try:
+            if not isinstance(payload, str):
+                payload = json.dumps(payload, ensure_ascii=False)
+            with self._conn() as c:
+                c.execute(
+                    "INSERT INTO notifications_log (ts, channel, topic, level, payload) VALUES (?, ?, ?, ?, ?)",
+                    (self._utc(), channel, topic, level.upper(), payload),
+                )
+                c.commit()
+        except Exception as e:
+            self.logger.debug(f"notifications_log insert skipped: {e}")

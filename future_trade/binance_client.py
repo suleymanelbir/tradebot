@@ -187,16 +187,40 @@ class BinanceClient:
     async def get_leverage_brackets(self, symbol: str):
         """
         /fapi/v1/leverageBracket – bakım marjı basamakları
+        Normalize edilmiş bracket listesi döner: floor, cap, mmr
         """
+        # 1) PAPER mode için varsayılan tek basamak
         if getattr(self, "mode", "paper").lower() == "paper" and getattr(self, "_paper_network_disabled", True):
-            # PAPER: tek basamak varsayalım
-            return [{"symbol": symbol, "brackets": [{"bracket": 1, "initialLeverage": 20, "maintMarginRatio": 0.004}]}]
-        get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None)
+            return [{"symbol": symbol, "brackets": [
+                {"floor": 0.0, "cap": 1e12, "mmr": 0.004}
+            ]}]
+
+        # 2) GET helper fallback (signed veya unsigned)
+        get = getattr(self, "_get_signed", None) or getattr(self, "http_get_signed", None) or getattr(self, "_get", None)
         if not callable(get):
-            raise RuntimeError("signed GET helper not found")
+            raise RuntimeError("GET helper not found for leverageBracket")
+
+        # 3) API çağrısı
         res = await get("/fapi/v1/leverageBracket", params={"symbol": symbol})
-        # Binance bazen liste içinde döner
-        return res
+
+        # 4) Normalize: float dönüşümü ve sıralama
+        brackets = []
+        try:
+            raw = res[0]["brackets"] if isinstance(res, list) and res and "brackets" in res[0] else res.get("brackets", [])
+            for r in raw:
+                try:
+                    floor = float(r.get("notionalFloor", 0))
+                    cap = float(r.get("notionalCap", float("inf")))
+                    mmr = float(r.get("maintMarginRatio", 0.004))
+                    brackets.append({"floor": floor, "cap": cap, "mmr": mmr})
+                except Exception:
+                    continue
+            brackets.sort(key=lambda x: x["floor"])
+        except Exception:
+            pass
+
+        return [{"symbol": symbol, "brackets": brackets}]
+
 
     async def get_available_usdt(self) -> float:
         acc = await self.get_account()

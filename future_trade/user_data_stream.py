@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import asyncio, json, logging, time, contextlib
-from typing import Any, Dict, Optional, Callable
+import asyncio, json, logging, contextlib
+from typing import Any, Dict, Optional
 
 import aiohttp
 
@@ -27,6 +27,7 @@ class UserDataStream:
         sweeper=None,                # ProtectiveSweeper (temizlik)
         logger: Optional[logging.Logger] = None,
         ws_base_url: Optional[str] = None,
+        risk=None,                     # RiskManager (opsiyonel, kullanılmıyor
     ):
         self.client = client
         self.notifier = notifier
@@ -42,6 +43,7 @@ class UserDataStream:
         self.listen_key: Optional[str] = None
         self._stop = asyncio.Event()
         self._keepalive_task: Optional[asyncio.Task] = None
+        self.risk = risk  # RiskManager (opsiyonel, kullanılmıyor
 
     # ------------- lifecycle -------------
     async def _create_or_refresh_key(self) -> str:
@@ -153,14 +155,33 @@ class UserDataStream:
             self.logger.error(f"[UDS] handle error: {e}")
 
     # ------------- handlers -------------
-    def _on_account_update(self, data: Dict[str, Any]):
-        """
-        İstersen availableBalance vs. cacheleyebilir, margin_guard için kullanabilirsin.
-        Şimdilik log+istenirse notifier.
-        """
-        self.logger.debug(f"[UDS] ACCOUNT_UPDATE")
-        # Örnek: with contextlib.suppress(Exception):
-        #   await self.notifier.info_trades({"event":"account_update"})
+        def _on_account_update(self, data: Dict[str, Any]):
+            """
+            ACCOUNT_UPDATE (Futures):
+            data["a"]["B"] = [{"a":"USDT","wb":"...","cw":"..."} , ...]
+            Burada "cw" (crossWalletBalance) pratikte anlık kullanılabilir bakiyeye en yakın değerdir.
+            İzole pozisyonlarda sembol bazlı farklar olabilir; approx kabul ederek cache'e yazarız.
+            """
+            try:
+                a = data.get("a") or {}
+                balances = a.get("B") or []
+                usdt = None
+                for b in balances:
+                    if str(b.get("a")).upper() == "USDT":
+                        usdt = b
+                        break
+                if not usdt:
+                    return
+                # wb: wallet balance, cw: cross wallet balance
+                wb = float(usdt.get("wb") or 0.0)
+                cw = float(usdt.get("cw") or wb)
+                approx_available = cw  # approx olarak cw'yi alıyoruz
+                if getattr(self, "risk", None) and hasattr(self.risk, "update_balance_cache"):
+                    self.risk.update_balance_cache(approx_available)
+                    self.logger.debug(f"[UDS] ACCOUNT_UPDATE → cache avail={approx_available:.4f}")
+            except Exception as e:
+                self.logger.debug(f"[UDS] account_update parse error: {e}")
+
 
     def _on_order_trade_update(self, data: Dict[str, Any]):
         """
