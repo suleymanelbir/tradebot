@@ -86,7 +86,8 @@ async def strat_loop(
     notifier,
     cfg: Dict[str, Any],
     kill_switch=None,
-    order_manager=None  # ← yeni parametre eklendi
+    order_manager=None,  # ← yeni parametre eklendi
+    selector=None        # sembol_selector  özelliği için eklendi
 ):
     log = logging.getLogger("strat_loop")
     tf_entry = (cfg.get("strategy", {}) or {}).get("timeframe_entry", "1h")
@@ -429,3 +430,26 @@ async def performance_guard_loop(
             log.error(f"performance guard loop error: {e}")
 
         await asyncio.sleep(max(30, int(interval_sec)))
+        
+# **********symbol_selector için eklendi************"
+
+async def selector_loop(selector, stop_event: asyncio.Event, notifier=None, cfg=None, interval_sec: int = 300):
+    import asyncio, logging
+    log = logging.getLogger("selector_loop")
+    rep_cfg = ((cfg or {}).get("dynamic_universe") or {}).get("reporting") or {}
+    annotated = bool(rep_cfg.get("annotated", True))
+    only_on_change = bool(rep_cfg.get("only_on_change", True))
+
+    while not (stop_event and stop_event.is_set()):
+        try:
+            rep = await selector.scan_once()
+            should_send = True
+            if only_on_change and not rep.get("change"):
+                should_send = False
+            if annotated and should_send and notifier and hasattr(notifier, "info_selection"):
+                await notifier.info_selection(rep)
+        except Exception as e:
+            log.error(f"selector scan error: {e}")
+        await asyncio.sleep(max(60, int(interval_sec)))
+
+    

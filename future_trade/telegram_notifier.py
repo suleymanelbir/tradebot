@@ -40,6 +40,8 @@ class Notifier:
         # aiohttp oturumu
         self._session: Optional[aiohttp.ClientSession] = None
 
+        self._selector = (self.cfg or {}).get("selection_bot") or {} 
+
     # 2) İç yardımcılar
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -276,3 +278,50 @@ class Notifier:
         text = "\n".join(lines)
 
         await self._send(self._alerts, text)
+
+
+    # Bu helper symbol_elector için eklendi "
+    async def info_selection(self, payload: Dict[str, Any]) -> None:
+        """
+        Sembol seçici raporları (3. bot).
+        payload: {"event":"selector_update", "regime":"trend|chop", "weights":{...},
+                "long":[["SOLUSDT",0.73], ...], "short":[["XRPUSDT",0.71], ...],
+                "added_long":[...], "removed_long":[...], "added_short":[...], "removed_short":[...],
+                "topk":{"long":2,"short":2}, "change":true}
+        """
+        topic = str(payload.get("event") or "selector_update")
+        self._mirror_to_db(channel="selection_bot", topic=topic, level="INFO", payload=payload)
+
+        # okunur bir metin
+        def _fmt(x, nd=3):
+            try: return f"{float(x):.{nd}f}"
+            except: return str(x)
+
+        lines = [f"🧭 Selector Update  |  regime: {payload.get('regime','?')}",
+                f"TopK → LONG:{payload.get('topk',{}).get('long')} SHORT:{payload.get('topk',{}).get('short')}"]
+
+        wg = payload.get("weights") or {}
+        if wg:
+            lines.append("Weights: " + ", ".join([f"{k}:{_fmt(v,2)}" for k,v in wg.items()]))
+
+        def _rows(arr):
+            return ", ".join([f"{s}({_fmt(sc)})" for s,sc in (arr or [])])
+
+            lines.append("LONG:  " + _rows(payload.get("long")))
+            lines.append("SHORT: " + _rows(payload.get("short")))
+
+            # değişim vurgusu
+            if payload.get("change"):
+                addL = payload.get("added_long") or []
+                remL = payload.get("removed_long") or []
+                addS = payload.get("added_short") or []
+                remS = payload.get("removed_short") or []
+                if addL or remL or addS or remS:
+                    lines.append("Δ Changes:")
+                    if addL: lines.append("  +L " + ", ".join(addL))
+                    if remL: lines.append("  -L " + ", ".join(remL))
+                    if addS: lines.append("  +S " + ", ".join(addS))
+                    if remS: lines.append("  -S " + ", ".join(remS))
+
+        text = "\n".join(lines)
+        await self._send(self._selector, text)

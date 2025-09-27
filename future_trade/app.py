@@ -38,6 +38,10 @@ from future_trade.oco_watcher import OCOWatcher
 from future_trade.klines_cache import KlinesCache
 from future_trade.loops import position_risk_guard_loop
 from future_trade.loops import performance_guard_loop
+from future_trade.symbol_selector import SymbolSelector
+from future_trade.loops import selector_loop
+
+
 # =========================
 # 4) Strateji Sistemi
 # =========================
@@ -221,6 +225,17 @@ async def main() -> None:
         risk.bind_atr_provider(klines.get_atr)
 
     # =======================
+    # 9.1) SYMBOL SELECTOR (dinamik whitelist & yön-bazlı havuz)
+    # =======================
+    selector = SymbolSelector(
+        cfg=cfg,
+        client=client,
+        klines_cache=klines,
+        market_stream=stream,
+        logger=logging.getLogger("symbol_selector")
+    )
+
+    # =======================
     # 10) NORMALIZER & ROUTER & YÖNETİCİLER
     # =======================
     try:
@@ -364,7 +379,9 @@ async def main() -> None:
     tasks.append(asyncio.create_task(
         strat_loop(
             stream, strategy, portfolio, supervisor, risk, router,
-            persistence, notifier, cfg, kill_switch=kill_switch, order_manager=order_manager
+            persistence, notifier, cfg,
+            kill_switch=kill_switch, order_manager=order_manager,
+            selector=selector                    # <<< EKLENDİ
         ),
         name="strat_loop",
     ))
@@ -427,6 +444,20 @@ async def main() -> None:
     ),
     name="pnl_daily_summary",
     ))
+
+    # 14.12_a  Dinamik Sembol Seçici (Selector Loop)
+    sel_cfg = (cfg.get("dynamic_universe") or {})
+    if sel_cfg.get("enabled", True):
+        tasks.append(asyncio.create_task(
+            selector_loop(
+                selector=selector,
+                stop_event=stop,
+                notifier=notifier,                         # 3. bot raporları için
+                cfg=cfg,
+                interval_sec=int(sel_cfg.get("scan_interval_sec", 300))
+            ),
+            name="selector",
+        ))    
 
     await notifier.info_trades({"event": "startup", "msg": "✅ All modules initialized. Bot is running."})
     logging.info("All tasks scheduled. Bot is running.")
